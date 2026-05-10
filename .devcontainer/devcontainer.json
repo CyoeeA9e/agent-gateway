@@ -1,0 +1,8 @@
+{
+  "name": "agent-gateway",
+  "image": "registry.fedoraproject.org/fedora:latest",
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "type=bind,source=${localWorkspaceFolder},target=/workspace",
+  "postCreateCommand": "",
+  "remoteUser": "root",
+}
