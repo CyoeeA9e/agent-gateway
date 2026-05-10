@@ -17,22 +17,22 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use super::{AgentSession, AgentDelta, AgentError};
 use async_trait::async_trait;
 
-pub struct ClaudeCodeSession {
+pub struct OpenCodeSession {
     session_id: String,
     session: ActiveSession<'static, agent_client_protocol::Agent>,
 }
 
-impl ClaudeCodeSession {
+impl OpenCodeSession {
     pub fn new(
         session_id: String,
         session: ActiveSession<'static, agent_client_protocol::Agent>,
     ) -> Self {
-        ClaudeCodeSession { session_id, session }
+        OpenCodeSession { session_id, session }
     }
 }
 
 #[async_trait]
-impl AgentSession for ClaudeCodeSession {
+impl AgentSession for OpenCodeSession {
     fn id(&self) -> String {
         self.session_id.clone()
     }
@@ -75,15 +75,15 @@ impl AgentSession for ClaudeCodeSession {
     }
 }
 
-pub struct ClaudeCode {
+pub struct OpenCodeAgent {
     child: Option<Child>,
     conn: Option<ConnectionTo<agent_client_protocol::Agent>>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-impl ClaudeCode {
+impl OpenCodeAgent {
     pub fn new() -> Self {
-        ClaudeCode {
+        OpenCodeAgent {
             child: None,
             conn: None,
             shutdown_tx: None,
@@ -112,7 +112,7 @@ impl ClaudeCode {
             .map_err(|e| AgentError::Acp(e.to_string()))?;
 
         let sid = active_session.session_id().clone().to_string();
-        let session = ClaudeCodeSession::new(sid.clone(), active_session);
+        let session = OpenCodeSession::new(sid.clone(), active_session);
         Ok((sid, Box::new(session)))
     }
 
@@ -165,7 +165,7 @@ impl ClaudeCode {
         }
 
         let sid = active_session.session_id().clone().to_string();
-        let session = ClaudeCodeSession::new(sid.clone(), active_session);
+        let session = OpenCodeSession::new(sid.clone(), active_session);
         Ok((sid, Box::new(session)))
     }
 
@@ -175,18 +175,19 @@ impl ClaudeCode {
         }
     }
 
-    pub async fn start(&mut self) -> Result<(), AgentError> {
-        let mut cmd = TokioCommand::new("claude-agent-acp");
-        cmd.stdin(Stdio::piped())
+    async fn start(&mut self) -> Result<(), AgentError> {
+        let mut cmd = TokioCommand::new("opencode");
+        cmd.arg("acp")
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
 
         let mut child = cmd.spawn()?;
         let child_stdin = child.stdin.take().ok_or_else(|| {
-            AgentError::Acp("Failed to open agent stdin".into())
+            AgentError::Acp("Failed to open opencode stdin".into())
         })?;
         let child_stdout = child.stdout.take().ok_or_else(|| {
-            AgentError::Acp("Failed to open agent stdout".into())
+            AgentError::Acp("Failed to open opencode stdout".into())
         })?;
 
         let transport = ByteStreams::new(child_stdin.compat_write(), child_stdout.compat());
@@ -234,7 +235,7 @@ impl ClaudeCode {
                         .await?;
 
                     tracing::info!(
-                        "Claude Code ACP capabilities: load_session={}, session_capabilities={:?}, agent_info={:?}",
+                        "OpenCode ACP capabilities: load_session={}, session_capabilities={:?}, agent_info={:?}",
                         init_response.agent_capabilities.load_session,
                         init_response.agent_capabilities.session_capabilities,
                         init_response.agent_info,
@@ -248,7 +249,7 @@ impl ClaudeCode {
                 .await;
 
             if let Err(e) = result {
-                tracing::error!("ACP connection error: {e}");
+                tracing::error!("OpenCode ACP connection error: {e}");
             }
         });
 
@@ -256,7 +257,7 @@ impl ClaudeCode {
         self.shutdown_tx = Some(shutdown_tx);
 
         self.conn = Some(init_rx.await
-            .map_err(|_| AgentError::Acp("ACP initialization failed".into()))?);
+            .map_err(|_| AgentError::Acp("OpenCode ACP initialization failed".into()))?);
         Ok(())
     }
 

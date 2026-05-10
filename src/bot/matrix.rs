@@ -24,11 +24,11 @@ use matrix_sdk::{
     },
 };
 
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{AgentDelta, AgentRegistry, AgentSession};
+use crate::agent::{AgentDelta, AgentError, AgentRegistry, AgentSession, AgentType};
 use crate::config::GatewayConfig;
 
 fn persist_sessions(sessions: &HashMap<String, Session>, path: &Path) {
@@ -43,44 +43,54 @@ fn save_session(sessions: &mut HashMap<String, Session>, path: &Path, session: S
 }
 
 pub struct MatrixBot {
-    cc: Arc<Mutex<AgentRegistry>>,
-    sessions: Arc<Mutex<HashMap<String, Session>>>,
+    cc: AsyncMutex<AgentRegistry>,
+    sessions: AsyncMutex<HashMap<String, Session>>,
     sessions_path: PathBuf,
     state_dir: PathBuf,
     config_path: PathBuf,
-    pending_encrypted: Arc<Mutex<HashMap<String, Vec<OwnedEventId>>>>,
+    pending_encrypted: AsyncMutex<HashMap<String, Vec<OwnedEventId>>>,
+    allowed: Arc<HashSet<String>>,
+    bot_id: String,
 }
 
 impl MatrixBot {
     pub fn new(
-        cc: Arc<Mutex<AgentRegistry>>,
+        registry: AgentRegistry,
         state_dir: PathBuf,
         config_path: PathBuf,
         sessions: HashMap<String, Session>,
         sessions_path: PathBuf,
-    ) -> Self {
-        Self {
-            cc,
-            sessions: Arc::new(Mutex::new(sessions)),
+    ) -> Arc<Self> {
+        let cfg = GatewayConfig::from_file(&config_path).ok();
+        let allowed = cfg
+            .as_ref()
+            .map(|c| Arc::new(c.matrix.allowed_user.iter().cloned().collect()))
+            .unwrap_or_default();
+        let bot_id = cfg
+            .as_ref()
+            .map(|c| c.matrix.id.clone())
+            .unwrap_or_default();
+        Arc::new(MatrixBot {
+            cc: AsyncMutex::new(registry),
+            sessions: AsyncMutex::new(sessions),
             sessions_path,
             state_dir,
             config_path,
-            pending_encrypted: Arc::new(Mutex::new(HashMap::new())),
-        }
+            pending_encrypted: AsyncMutex::new(HashMap::new()),
+            allowed,
+            bot_id,
+        })
     }
 
-    pub async fn start(&self) -> anyhow::Result<()> {
+    pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         let cfg = GatewayConfig::from_file(&self.config_path)?;
 
         let matrix_cfg = &cfg.matrix;
         let user_id: OwnedUserId = matrix_cfg.id.parse().context("Invalid Matrix user ID")?;
-        let bot_id_str = user_id.to_string();
         let server_name = user_id.server_name().to_string();
         let homeserver_url = format!("https://{server_name}");
 
-        let allowed: Arc<HashSet<String>> =
-            Arc::new(matrix_cfg.allowed_user.iter().cloned().collect());
-        tracing::info!("Allowed users: {:?}", allowed);
+        tracing::info!("Allowed users: {:?}", self.allowed);
 
         let session_file = self.state_dir.join("session.json");
         let crypto_path = self.state_dir.join("matrix_store");
@@ -177,82 +187,56 @@ impl MatrixBot {
         }
 
         // ---- invite handler ----
-        client.add_event_handler({
-            let allowed = allowed.clone();
-            let bot_id = bot_id_str.clone();
-            let sessions = self.sessions.clone();
-            let sessions_path = self.sessions_path.clone();
-            let cc = self.cc.clone();
-            move |event: StrippedRoomMemberEvent, room: matrix_sdk::room::Room, client: Client| {
-                let allowed = allowed.clone();
-                let bot_id = bot_id.clone();
-                let sessions = sessions.clone();
-                let sessions_path = sessions_path.clone();
-                let cc = cc.clone();
-                async move {
-                    on_invite(
-                        event,
-                        room,
-                        client,
-                        cc,
-                        allowed,
-                        sessions,
-                        sessions_path,
-                        bot_id,
-                    )
-                    .await
-                }
-            }
-        });
+        {
+            let bot = self.clone();
+            client.add_event_handler(
+                move |event: StrippedRoomMemberEvent,
+                      room: matrix_sdk::room::Room,
+                      client: Client| {
+                    let bot = bot.clone();
+                    async move { on_invite(event, room, client, &bot).await }
+                },
+            );
+        }
 
         // ---- member leave handler ----
-        client.add_event_handler({
-            let bot_id = bot_id_str.clone();
-            let sessions = self.sessions.clone();
-            let sessions_path = self.sessions_path.clone();
-            move |event: OriginalSyncRoomMemberEvent, room: matrix_sdk::room::Room| {
-                let bot_id = bot_id.clone();
-                let sessions = sessions.clone();
-                let sessions_path = sessions_path.clone();
-                async move {
-                    on_member_change(event, room, sessions, sessions_path, bot_id).await
-                }
-            }
-        });
+        {
+            let bot = self.clone();
+            client.add_event_handler(
+                move |event: OriginalSyncRoomMemberEvent, room: matrix_sdk::room::Room| {
+                    let bot = bot.clone();
+                    async move { on_member_change(event, room, &bot).await }
+                },
+            );
+        }
 
-        client.add_event_handler({
-            let cc = self.cc.clone();
-            let allowed = allowed.clone();
-            let sessions = self.sessions.clone();
-            let sessions_path = self.sessions_path.clone();
-            move |event, room| {
-                let cc = cc.clone();
-                let allowed = allowed.clone();
-                let sessions = sessions.clone();
-                let sessions_path = sessions_path.clone();
-                on_room_message(event, room, cc, allowed, sessions, sessions_path)
-            }
-        });
+        // ---- room message handler ----
+        {
+            let bot = self.clone();
+            client.add_event_handler(
+                move |event: OriginalSyncRoomMessageEvent, room: matrix_sdk::room::Room| {
+                    let bot = bot.clone();
+                    async move { on_room_message(event, room, &bot).await }
+                },
+            );
+        }
 
         // ---- encrypted message handler ----
-        client.add_event_handler({
-            let allowed = allowed.clone();
-            let pending = self.pending_encrypted.clone();
-            move |event: OriginalSyncRoomEncryptedEvent, room: matrix_sdk::room::Room| {
-                let allowed = allowed.clone();
-                let pending = pending.clone();
-                on_encrypted_message(event, room, allowed, pending)
-            }
-        });
+        {
+            let bot = self.clone();
+            client.add_event_handler(
+                move |event: OriginalSyncRoomEncryptedEvent, room: matrix_sdk::room::Room| {
+                    let bot = bot.clone();
+                    async move { on_encrypted_message(event, room, &bot).await }
+                },
+            );
+        }
 
         // ---- key stream listener ----
         {
             use futures::StreamExt;
             let key_client = client.clone();
-            let pending = self.pending_encrypted.clone();
-            let cc = self.cc.clone();
-            let sessions = self.sessions.clone();
-            let sessions_path = self.sessions_path.clone();
+            let bot = self.clone();
             tokio::spawn(async move {
                 let Some(mut stream) = key_client.encryption().room_keys_received_stream().await
                 else {
@@ -266,7 +250,7 @@ impl MatrixBot {
                                 let room_id = &key_info.room_id;
                                 let room_id_str = room_id.as_str().to_owned();
                                 let events = {
-                                    let mut p = pending.lock().await;
+                                    let mut p = bot.pending_encrypted.lock().await;
                                     p.remove(&room_id_str).unwrap_or_default()
                                 };
                                 if events.is_empty() {
@@ -288,13 +272,21 @@ impl MatrixBot {
                                                     if let MessageType::Text(text) =
                                                         &decrypted.content.msgtype
                                                     {
-                                                        process_with_claude(
+                                                        let agent_session = match bot
+                                                            .get_or_create_session(&room)
+                                                            .await
+                                                        {
+                                                            Ok(a) => a,
+                                                            Err(e) => {
+                                                                let content = RoomMessageEventContent::text_plain(e.to_string());
+                                                                let _ = room.send(content).await;
+                                                                continue;
+                                                            }
+                                                        };
+                                                        bot.run_task(
                                                             text.body.clone(),
-                                                            room_id_str.clone(),
                                                             room.clone(),
-                                                            cc.clone(),
-                                                            sessions.clone(),
-                                                            sessions_path.clone(),
+                                                            agent_session,
                                                         )
                                                         .await;
                                                     }
@@ -308,7 +300,7 @@ impl MatrixBot {
                                             tracing::warn!(
                                                 "Fetching pending event {event_id}: {e}"
                                             );
-                                            pending
+                                            bot.pending_encrypted
                                                 .lock()
                                                 .await
                                                 .entry(room_id_str.clone())
@@ -347,12 +339,8 @@ impl MatrixBot {
                 }
             }
         }
-        Ok(())
-    }
-
-    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        // Shutdown: persist sessions and drop agents before stopping ACP
         let mut map = self.sessions.lock().await;
-        // Drop all agent sessions to stop session actors before connection shutdown
         for s in map.values_mut() {
             s.agent_session = None;
         }
@@ -360,7 +348,7 @@ impl MatrixBot {
         tracing::info!("Room sessions saved");
         drop(map);
         self.cc.lock().await.shutdown().await?;
-        tracing::info!("Claude Code shut down");
+        tracing::info!("Agent shut down");
         Ok(())
     }
 }
@@ -382,6 +370,7 @@ pub struct Session {
     room_id: String,
     agent_session_id: Option<String>,
     pwd: Option<PathBuf>,
+    agent_type: AgentType,
     #[serde(skip)]
     pub agent_session: Option<Box<dyn AgentSession>>,
 }
@@ -392,7 +381,11 @@ impl std::fmt::Debug for Session {
             .field("room_id", &self.room_id)
             .field("agent_session_id", &self.agent_session_id)
             .field("pwd", &self.pwd)
-            .field("agent_session", &self.agent_session.as_ref().map(|_| "Some(...)"))
+            .field("agent_type", &self.agent_type)
+            .field(
+                "agent_session",
+                &self.agent_session.as_ref().map(|_| "Some(...)"),
+            )
             .finish()
     }
 }
@@ -403,6 +396,7 @@ impl Session {
             room_id,
             agent_session_id: None,
             pwd: Some(make_temp_dir()),
+            agent_type: AgentType::default(),
             agent_session: None,
         }
     }
@@ -450,7 +444,7 @@ fn handle_command(
 
     if cmd == "/help" {
         return Some(
-            "Available commands:\n/help — Show this help\n/setpwd <path> — Set working directory for Claude Code\n/reset — Reset the Claude Code session"
+            "Available commands:\n/help — Show this help\n/setpwd <path> — Set working directory\n/reset — Reset the Claude Code session\n/agent <type> — Switch agent (none, claude-code-acp, opencode)"
                 .into(),
         );
     }
@@ -462,6 +456,36 @@ fn handle_command(
         }
         persist_sessions(sessions, sessions_path);
         return Some("Session reset. A new session will be created on next message.".into());
+    }
+
+    if cmd == "/agent" {
+        let current = sessions
+            .get(room_id)
+            .map(|s| format!("{:?}", s.agent_type))
+            .unwrap_or_else(|| "none".into());
+        return Some(format!(
+            "Current agent: {current}\nAvailable: none, claude-code-acp, opencode"
+        ));
+    }
+
+    if let Some(type_str) = cmd.strip_prefix("/agent ") {
+        let new_type = match type_str.trim() {
+            "opencode" => AgentType::OpenCode,
+            "claude-code-acp" => AgentType::ClaudeCodeAcp,
+            "none" => AgentType::None,
+            _ => {
+                return Some(
+                    "Unknown agent type. Available: none, claude-code-acp, opencode".into(),
+                );
+            }
+        };
+        if let Some(session) = sessions.get_mut(room_id) {
+            session.agent_session = None;
+            session.clear_agent_session_id();
+            session.agent_type = new_type;
+        }
+        persist_sessions(sessions, sessions_path);
+        return Some(format!("Switched to {}.", type_str.trim()));
     }
 
     if cmd == "/setpwd" {
@@ -502,69 +526,75 @@ fn handle_command(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn process_with_claude(
-    body: String,
-    room_id: String,
-    room: matrix_sdk::room::Room,
-    cc: Arc<Mutex<AgentRegistry>>,
-    sessions: Arc<Mutex<HashMap<String, Session>>>,
-    sessions_path: PathBuf,
-) {
-    let mut agent_session: Box<dyn AgentSession> = {
-        let mut smap = sessions.lock().await;
-        match smap.get_mut(&room_id).and_then(|s| s.agent_session.take()) {
-            Some(a) => a,
+impl MatrixBot {
+    async fn get_or_create_session(
+        &self,
+        room: &matrix_sdk::room::Room,
+    ) -> Result<Box<dyn AgentSession>, AgentError> {
+        let room_id = room.room_id().as_str();
+        let mut smap = self.sessions.lock().await;
+        match smap.get_mut(room_id).and_then(|s| s.agent_session.take()) {
+            Some(a) => Ok(a),
             None => {
-                let pwd = match smap.get(&room_id) {
-                    Some(s) => s.pwd.clone().unwrap_or_else(make_temp_dir),
+                let (pwd, agent_type, session_id) = match smap.get(room_id) {
+                    Some(s) => {
+                        if s.agent_type == AgentType::None {
+                            return Err(AgentError::Acp(
+                                "No agent selected. Use /agent <type> to choose an agent.\nAvailable: none, claude-code-acp, opencode".into(),
+                            ));
+                        }
+                        (
+                            s.pwd.clone().unwrap_or_else(make_temp_dir),
+                            s.agent_type.clone(),
+                            s.agent_session_id.clone(),
+                        )
+                    }
                     None => {
-                        let s = Session::new(room_id.clone());
+                        let s = Session::new(room_id.to_owned());
                         let pwd = s.pwd.clone().unwrap_or_else(make_temp_dir);
-                        save_session(&mut smap, &sessions_path, s);
-                        tracing::info!(
-                            "New session for room {}: pwd={}",
-                            room_id,
-                            pwd.display()
-                        );
-                        pwd
+                        let agent_type = AgentType::ClaudeCodeAcp;
+                        save_session(&mut smap, &self.sessions_path, s);
+                        tracing::info!("New session for room {}: pwd={}", room_id, pwd.display());
+                        (pwd, agent_type, None)
                     }
                 };
                 drop(smap);
 
-                let mut cc = cc.lock().await;
-                match cc.create_session(pwd).await {
+                let mut cc = self.cc.lock().await;
+                match cc.create_session(pwd, &agent_type, session_id).await {
                     Ok((sid, agent)) => {
-                        let mut smap = sessions.lock().await;
-                        if let Some(entry) = smap.get_mut(&room_id) {
+                        let mut smap = self.sessions.lock().await;
+                        if let Some(entry) = smap.get_mut(room_id) {
                             entry.set_agent_session_id(sid);
-                            persist_sessions(&smap, &sessions_path);
+                            persist_sessions(&smap, &self.sessions_path);
                         }
-                        agent
+                        Ok(agent)
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to create ACP session: {e}");
-                        let content = RoomMessageEventContent::text_plain(format!(
-                            "Error creating session: {e}"
-                        ));
-                        let _ = room.send(content).await;
-                        return;
-                    }
+                    Err(e) => Err(e),
                 }
             }
         }
-    };
-
-    if let Err(e) = agent_session.send_input(&body) {
-        tracing::error!("Failed to send input to Claude Code: {e}");
-        let _ = room.typing_notice(false).await;
-        let content = RoomMessageEventContent::text_plain(format!("Error: {e}"));
-        let _ = room.send(content).await;
-        if let Some(s) = sessions.lock().await.get_mut(&room_id) {
-            s.agent_session = Some(agent_session);
-        }
-        return;
     }
+}
+
+impl MatrixBot {
+    async fn run_task(
+        &self,
+        body: String,
+        room: matrix_sdk::room::Room,
+        mut agent_session: Box<dyn AgentSession>,
+    ) {
+        let room_id = room.room_id().to_string();
+        if let Err(e) = agent_session.send_input(&body) {
+            tracing::error!("Failed to send input to Claude Code: {e}");
+            let _ = room.typing_notice(false).await;
+            let content = RoomMessageEventContent::text_plain(format!("Error: {e}"));
+            let _ = room.send(content).await;
+            if let Some(s) = self.sessions.lock().await.get_mut(&room_id) {
+                s.agent_session = Some(agent_session);
+            }
+            return;
+        }
 
     const THINKING: &str = "*Thinking*";
     let placeholder = RoomMessageEventContent::text_plain(THINKING);
@@ -585,32 +615,25 @@ async fn process_with_claude(
             break;
         }
 
-        let deltas = agent_session.query_delta().unwrap_or_else(|e| {
-            tracing::error!("Error querying Claude Code: {e}");
-            vec![AgentDelta::Text {
-                output: String::new(),
-                done: true,
-            }]
-        });
-
         let mut done = false;
-        for d in deltas {
-            match d {
-                AgentDelta::Text {
-                    output,
-                    done: is_done,
-                } => {
-                    if !output.is_empty() {
-                        full_output.push_str(&output);
-                    }
-                    if is_done {
-                        done = true;
-                    }
+        match agent_session.query_delta().await {
+            Ok(Some(AgentDelta::Text {
+                output,
+                done: is_done,
+            })) => {
+                if !output.is_empty() {
+                    full_output.push_str(&output);
                 }
-                AgentDelta::ToolCall { title } => {
-                    let content = RoomMessageEventContent::text_plain(&format!("> **{title}**"));
-                    let _ = room.send(content).await;
-                }
+                done = is_done;
+            }
+            Ok(Some(AgentDelta::ToolCall { title })) => {
+                let content = RoomMessageEventContent::text_plain(&format!("> **{title}**"));
+                let _ = room.send(content).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("Error querying Claude Code: {e}");
+                break;
             }
         }
 
@@ -643,28 +666,24 @@ async fn process_with_claude(
             }
             break;
         }
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
-    if let Some(s) = sessions.lock().await.get_mut(&room_id) {
+    if let Some(s) = self.sessions.lock().await.get_mut(&room_id) {
         s.agent_session = Some(agent_session);
     }
+}
 }
 
 async fn on_room_message(
     event: OriginalSyncRoomMessageEvent,
     room: matrix_sdk::room::Room,
-    cc: Arc<Mutex<AgentRegistry>>,
-    allowed: Arc<HashSet<String>>,
-    sessions: Arc<Mutex<HashMap<String, Session>>>,
-    sessions_path: PathBuf,
+    bot: &MatrixBot,
 ) {
     if *room.own_user_id() == event.sender {
         return;
     }
 
-    if !is_allowed(event.sender.as_str(), &allowed) {
+    if !is_allowed(event.sender.as_str(), &bot.allowed) {
         tracing::debug!("Ignoring message from non-allowed user {}", event.sender);
         return;
     }
@@ -682,12 +701,12 @@ async fn on_room_message(
 
     if text_content.body.starts_with('/') {
         let reply = {
-            let mut sessions_map = sessions.lock().await;
+            let mut sessions_map = bot.sessions.lock().await;
             handle_command(
                 &text_content.body,
                 room.room_id().as_str(),
                 &mut sessions_map,
-                &sessions_path,
+                &bot.sessions_path,
             )
         };
         if let Some(reply) = reply {
@@ -699,29 +718,27 @@ async fn on_room_message(
         }
     }
 
-    let room_id = room.room_id().to_string();
-    process_with_claude(
-        text_content.body.clone(),
-        room_id,
-        room,
-        cc,
-        sessions,
-        sessions_path,
-    )
-    .await;
+    let agent_session = match bot.get_or_create_session(&room).await {
+        Ok(a) => a,
+        Err(e) => {
+            let content = RoomMessageEventContent::text_plain(e.to_string());
+            let _ = room.send(content).await;
+            return;
+        }
+    };
+    bot.run_task(text_content.body.clone(), room, agent_session).await;
 }
 
 async fn on_encrypted_message(
     event: OriginalSyncRoomEncryptedEvent,
     _room: matrix_sdk::room::Room,
-    allowed: Arc<HashSet<String>>,
-    pending_encrypted: Arc<Mutex<HashMap<String, Vec<OwnedEventId>>>>,
+    bot: &MatrixBot,
 ) {
     if *_room.own_user_id() == event.sender {
         return;
     }
 
-    if !is_allowed(event.sender.as_str(), &allowed) {
+    if !is_allowed(event.sender.as_str(), &bot.allowed) {
         tracing::debug!(
             "Ignoring encrypted message from non-allowed user {}",
             event.sender
@@ -735,7 +752,7 @@ async fn on_encrypted_message(
         _room.room_id(),
     );
 
-    pending_encrypted
+    bot.pending_encrypted
         .lock()
         .await
         .entry(_room.room_id().to_string())
@@ -747,19 +764,15 @@ async fn on_invite(
     event: StrippedRoomMemberEvent,
     room: matrix_sdk::room::Room,
     client: Client,
-    cc: Arc<Mutex<AgentRegistry>>,
-    allowed: Arc<HashSet<String>>,
-    sessions: Arc<Mutex<HashMap<String, Session>>>,
-    sessions_path: PathBuf,
-    bot_id: String,
+    bot: &MatrixBot,
 ) {
-    if event.state_key.as_str() != bot_id {
+    if event.state_key.as_str() != bot.bot_id {
         return;
     }
     let inviter = event.sender.to_string();
     tracing::info!("Invite from {inviter} to room {}", room.room_id());
 
-    if !is_allowed(&inviter, &allowed) {
+    if !is_allowed(&inviter, &bot.allowed) {
         tracing::info!("Rejecting invite from non-allowed user {inviter}");
         if let Err(e) = room.leave().await {
             tracing::warn!("Failed to reject invite for {}: {e}", room.room_id());
@@ -782,30 +795,36 @@ async fn on_invite(
         joined.name().unwrap_or_else(|| "unnamed".into()),
     );
 
-    let map = sessions.lock().await;
+    let map = bot.sessions.lock().await;
     if map.contains_key(joined.room_id().as_str()) {
         return;
     }
     drop(map);
 
     let pwd = make_temp_dir();
-    let result = cc.lock().await.create_session(pwd.clone()).await;
+    let result = bot
+        .cc
+        .lock()
+        .await
+        .create_session(pwd.clone(), &AgentType::ClaudeCodeAcp, None)
+        .await;
 
     let room_id = joined.room_id().to_string();
-    let mut map = sessions.lock().await;
+    let mut map = bot.sessions.lock().await;
     match result {
         Ok((sid, agent)) => {
             let s = Session {
                 room_id: room_id.clone(),
                 agent_session_id: Some(sid),
                 pwd: Some(pwd),
+                agent_type: AgentType::ClaudeCodeAcp,
                 agent_session: Some(agent),
             };
             tracing::info!("Created ACP session for room {room_id}");
-            save_session(&mut map, &sessions_path, s);
+            save_session(&mut map, &bot.sessions_path, s);
         }
         Err(_) => {
-            save_session(&mut map, &sessions_path, Session::new(room_id));
+            save_session(&mut map, &bot.sessions_path, Session::new(room_id));
         }
     }
 }
@@ -813,20 +832,18 @@ async fn on_invite(
 async fn on_member_change(
     event: OriginalSyncRoomMemberEvent,
     room: matrix_sdk::room::Room,
-    sessions: Arc<Mutex<HashMap<String, Session>>>,
-    sessions_path: PathBuf,
-    bot_id: String,
+    bot: &MatrixBot,
 ) {
     let room_id = room.room_id().to_string();
 
-    if event.state_key.as_str() == bot_id {
+    if event.state_key.as_str() == bot.bot_id {
         if event.content.membership == MembershipState::Leave
             || event.content.membership == MembershipState::Ban
         {
             tracing::info!("Removed from room {room_id}, cleaning up session");
-            let mut map = sessions.lock().await;
+            let mut map = bot.sessions.lock().await;
             map.remove(&room_id);
-            persist_sessions(&map, &sessions_path);
+            persist_sessions(&map, &bot.sessions_path);
         }
     } else if event.content.membership == MembershipState::Leave
         || event.content.membership == MembershipState::Ban
@@ -834,9 +851,9 @@ async fn on_member_change(
         if let Ok(members) = room.members(RoomMemberships::JOIN).await {
             if members.len() <= 1 {
                 tracing::info!("Only bot left in room {room_id}, leaving");
-                let mut map = sessions.lock().await;
+                let mut map = bot.sessions.lock().await;
                 map.remove(&room_id);
-                persist_sessions(&map, &sessions_path);
+                persist_sessions(&map, &bot.sessions_path);
                 drop(map);
                 if let Err(e) = room.leave().await {
                     tracing::error!("Failed to leave empty room {room_id}: {e}");

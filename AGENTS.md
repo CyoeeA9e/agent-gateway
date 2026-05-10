@@ -1,12 +1,11 @@
 # agent-gateway
 
-Matrix → Claude Code gateway via ACP (Agent Client Protocol).
+Matrix → Claude Code / OpenCode gateway via ACP (Agent Client Protocol).
 
 ## Prerequisites
 
-`claude-agent-acp` must be installed globally: `npm install -g @agentclientprotocol/claude-agent-acp`
-
-Spawns a single persistent `claude-agent-acp` subprocess. All rooms share one child process but each gets its own ACP session.
+- `claude-agent-acp`: `npm install -g @agentclientprotocol/claude-agent-acp`
+- `opencode`: installed globally (optional, for `/agent opencode`)
 
 ## Commands
 
@@ -15,73 +14,71 @@ cargo build             # compile
 cargo check             # type-check
 cargo clippy            # lint
 cargo fmt               # format
-cargo test              # all tests (sequential via .cargo/config.toml)
-cargo test --test simulate test_single_turn -- --nocapture  # single test with output
+cargo test              # all tests (sequential via RUST_TEST_THREADS=1)
+cargo run -- --config ~/.config/agent-gateway/config.toml    # --config is required
 ```
 
-Tests run sequentially (`RUST_TEST_THREADS=1` in `.cargo/config.toml`). Start the gateway with:
-
-```bash
-cargo run -- --config ~/.config/agent-gateway/config.toml
-```
-
-## Restart after code changes
+## Restart
 
 ```bash
 pkill -x agent-gateway 2>/dev/null; sleep 1; nohup cargo run -- --config ~/.config/agent-gateway/config.toml > /tmp/gateway.log 2>&1 &
 ```
 
-This sequence is tested as the most reliable:
-1. `pkill -x agent-gateway` — kills the running binary by exact process name (does not match `cargo` wrapper or zombie processes)
-2. `sleep 1` — gives time for cleanup (session persist, ACP shutdown)
-3. `nohup cargo run ... &` — builds and starts a new instance in background, logs saved to `/tmp/gateway.log`
-
-Note: `pkill -x agent-gateway` matches only the binary process name, not the `cargo run` wrapper. Do NOT use `pkill -f "cargo run"` as it may match the current command. If the binary was started via `cargo run`, killing it will cause cargo to exit on its own.
-
-The gateway checks for duplicate instances on startup via Matrix device listing — if another device with display name `agent-gateway` with recent activity (<60s) is detected, it exits with an error to prevent duplicate responses.
+- `pkill -x agent-gateway` kills the binary by exact process name (not `cargo` wrapper).
+- Do NOT use `pkill -f "cargo run"` — it may match the current command.
+- Logs saved to `/tmp/gateway.log`.
+- Duplicate instance check: if another device named `agent-gateway` with activity <60s is detected, startup fails.
 
 ## Architecture
 
-- **`src/agent.rs`** — `AgentSession` trait (`send_input`, `query_delta` — synchronous, object-safe) and `AgentRegistry` (wraps `ClaudeCode`, entry point for creating sessions). `AgentDelta` is an enum: `AgentDelta::Text { output, done }` and `AgentDelta::ToolCall { title }` (unused, reserved)
-- **`src/agent/cc.rs`** — `ClaudeCode`: spawns `claude-agent-acp`, communicates via JSON-RPC 2.0 over STDIO using `agent-client-protocol` crate. `ClaudeCodeSession`: per-room `Box<dyn AgentSession>` handle. Only `ContentBlock::Text` from `AgentMessageChunk` is forwarded; `ToolCall`, `ToolCallUpdate`, `AgentThoughtChunk` are discarded
-- **`src/bot/matrix.rs`** — `MatrixBot` with four event handlers (`on_invite`, `on_member_change`, `on_room_message`, `on_encrypted_message`). `agents` map (`HashMap<String, Box<dyn AgentSession>>`) for per-room sessions
-- **`src/main.rs`** — Boilerplate: config → start registry → start bot → sync loop → shutdown
+- **`src/agent.rs`** — `AgentSession` trait (`send_input`, `async fn query_delta` returning `Option<AgentDelta>`, `id`), `AgentType` enum (`None`, `ClaudeCodeAcp`, `OpenCode`), `AgentRegistry` (manages both backends lazily)
+- **`src/agent/cc.rs`** — `ClaudeCode`: spawns `claude-agent-acp`. `ClaudeCodeSession` holds `ActiveSession` directly, calls `send_prompt` / `read_update` on the ACP connection. `query_delta` has 1s timeout (no separate background task).
+- **`src/agent/opencode.rs`** — `OpenCodeAgent`: same pattern as `ClaudeCode` but spawns `opencode acp`
+- **`src/bot/matrix.rs`** — `MatrixBot` wraps all state (`AsyncMutex<AgentRegistry>`, `AsyncMutex<HashMap<String, Session>>`, `allowed`, `bot_id`). Event handlers receive `&MatrixBot`, access fields directly. `Session` stores per-room state (pwd, agent_type, agent_session, agent_session_id for cross-restart resume).
+- **`src/main.rs`** — Config → `MatrixBot::new()` → `bot.run().await`
 
-### ACP Flow
+### ACP flow
 
-1. `AgentRegistry::start()` → initialize handshake, no session created yet
-2. `AgentRegistry::create_session(pwd)` → sends `session/new` via ACP, spawns a background task (`run_session`) per session that reads updates and forwards to a per-session delta channel
-3. `AgentSession::send_input()` → sends prompt to the session actor via channel
-4. `AgentSession::query_delta()` → returns `Vec<AgentDelta>` (non-blocking, drains all available deltas)
+No background per-session actor:
 
-Permissions from the agent (tool approval requests) are auto-approved.
+1. `send_input(text)` → `session.send_prompt(text)` (sync)
+2. `query_delta().await` → `session.read_update()` with 1s timeout, returns `Option<AgentDelta>`
+3. `MatrixBot::run_task()` polls `query_delta()` — timeout doubles as pacing, no separate `sleep`
+
+Permissions from the agent are auto-approved.
+
+### Backend selection
+
+Default: `AgentType::None` (message rejected with "select an agent").
+Per-room via Matrix chat:
+- `/agent` — show current agent
+- `/agent claude-code-acp` — switch to Claude Code
+- `/agent opencode` — switch to OpenCode
+
+Backends are lazy-started on first use (both backends can coexist; chosen per-room).
 
 ### Session lifecycle
 
-- Invite handler: joins room → `AgentRegistry::create_session()` → stores `Box<dyn AgentSession>` in agents map
-- Message handler: `remove()`s agent from map → uses directly (`send_input`+`query_delta`) → `insert()`s back
-- Kick/leave handler: removes agent from map (drops it → closes channel → stops session actor) and removes room from persisted sessions
-- On restart: stale ACP session IDs are cleared; new sessions created on first message
-
-### Encryption
-
-Rooms are end-to-end encrypted. Message flow:
-1. Decrypted messages → `on_room_message` handles directly
-2. Encrypted messages (key not yet arrived) → `on_encrypted_message` queues event_id → `room_keys_received_stream` listener picks up keys → calls `room.event()` to fetch decrypted content → processes via Claude
+- **New room**: `Session` created with `agent_type: None`. User must `/agent <type>` first.
+- **Message**: `MatrixBot::get_or_create_session()` takes agent from `Session.agent_session.take()`, or creates one via `AgentRegistry::create_session()`. Stored back after response.
+- **Cross-restart resume**: `agent_session_id` persisted in `room_sessions.json`. On next message, `session/load` is attempted first; falls back to `session/new`.
+- **Session/load history**: replay drained in `load_session()` — `AvailableCommandsUpdate` or `UsageUpdate` marks completion.
+- **Kick/leave**: session entry removed from map (drops `agent_session`, closing the ACP session).
+- **`/reset`**: drops current agent session, clears `agent_session_id`.
 
 ### Streaming responses
 
-Bot uses Matrix `m.replace` edits for streaming:
-1. Sends `*Thinking*` placeholder message immediately
-2. Polls Claude Code every 1s, accumulates output
-3. Every 2s (or on completion), edits the placeholder to `<content>\n*Thinking*`
-4. On completion, final edit removes `*Thinking*`, leaving only the response
+Bot uses Matrix `m.replace` edits:
+1. Sends `*Thinking*` placeholder
+2. `run_task` polls `query_delta().await` every ~1s, accumulates output
+3. Edits placeholder every 2s (or on completion)
+4. Final edit removes `*Thinking*`
 
-Fallback: if placeholder send fails, sends final response as one-shot message.
+Fallback: if placeholder send fails, sends one-shot message.
 
 ### Room leave safety
 
-If the bot is kicked or leaves a room mid-response, `process_with_claude()` detects it at the top of its polling loop — `room.typing_notice(true)` will fail with 403 when no longer joined, causing an immediate break. This prevents repeated `M_FORBIDDEN` errors from typing indicator refresh after leaving.
+`run_task` loop checks `room.typing_notice(true)` — 403 means no longer joined, triggers immediate break.
 
 ## Config
 
@@ -93,7 +90,7 @@ password = "..."
 allowed-user = ["@admin:server"]
 ```
 
-Data directories (XDG-style fallback):
+Data directories (XDG-style):
 
 | Var | Default |
 |---|---|
@@ -102,5 +99,6 @@ Data directories (XDG-style fallback):
 
 ## Important
 
-- `CLAUDE.md` is stale — do not rely on it for architecture details
+- `CLAUDE.md` is stale — do not rely on it
 - `--debug` enables debug-level logging (default: info)
+- Tests run sequentially (`RUST_TEST_THREADS=1` in `.cargo/config.toml`)

@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::Parser;
 use anyhow::Context;
-use tokio::sync::Mutex;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use agent_gateway::agent::AgentRegistry;
@@ -124,26 +122,12 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Config: {}", config_path.display());
 
     let sessions_path = state_dir.join("room_sessions.json");
-    let mut sessions: HashMap<String, Session> =
-        std::fs::read_to_string(&sessions_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-    // Clear stale ACP session IDs — child process is fresh on each start
-    for s in sessions.values_mut() {
-        s.clear_agent_session_id();
-    }
+    let sessions: HashMap<String, Session> = std::fs::read_to_string(&sessions_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
     tracing::info!("Loaded {} room sessions", sessions.len());
 
-    tracing::info!("Starting Claude Code via ACP...");
-    let mut registry = AgentRegistry::new(cache_dir);
-    registry.start().await?;
-    let registry = Arc::new(Mutex::new(registry));
-    tracing::info!("Claude Code ready");
-
-    let bot = MatrixBot::new(registry, state_dir, config_path, sessions, sessions_path);
-    let result = bot.start().await;
-    bot.shutdown().await?;
-
-    result
+    let bot = MatrixBot::new(AgentRegistry::new(), state_dir, config_path, sessions, sessions_path);
+    bot.run().await
 }

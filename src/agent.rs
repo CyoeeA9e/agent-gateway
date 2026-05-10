@@ -1,7 +1,11 @@
 pub mod cc;
+pub mod opencode;
 
-use std::path::PathBuf;
+use async_trait::async_trait;
 use cc::ClaudeCode;
+use opencode::OpenCodeAgent;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum AgentError {
@@ -38,32 +42,75 @@ pub enum AgentDelta {
     ToolCall { title: String },
 }
 
+#[async_trait]
 pub trait AgentSession: Send {
     fn send_input(&mut self, text: &str) -> Result<(), AgentError>;
-    fn query_delta(&mut self) -> Result<Vec<AgentDelta>, AgentError>;
+    async fn query_delta(&mut self) -> Result<Option<AgentDelta>, AgentError>;
     fn id(&self) -> String;
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentType {
+    #[default]
+    None,
+    ClaudeCodeAcp,
+    OpenCode,
+}
+
 pub struct AgentRegistry {
-    cc: ClaudeCode,
+    cc: Option<ClaudeCode>,
+    opencode: Option<OpenCodeAgent>,
 }
 
 impl AgentRegistry {
-    pub fn new(data_dir: PathBuf) -> Self {
+    pub fn new() -> Self {
         AgentRegistry {
-            cc: ClaudeCode::new(data_dir),
+            cc: None,
+            opencode: None,
         }
     }
 
-    pub async fn start(&mut self) -> Result<(), AgentError> {
-        self.cc.start().await
-    }
-
-    pub async fn create_session(&mut self, pwd: PathBuf) -> Result<(String, Box<dyn AgentSession>), AgentError> {
-        self.cc.create_session(pwd).await
+    pub async fn create_session(
+        &mut self,
+        pwd: PathBuf,
+        agent_type: &AgentType,
+        session_id: Option<String>,
+    ) -> Result<(String, Box<dyn AgentSession>), AgentError> {
+        match agent_type {
+            AgentType::None => unreachable!("None is handled by get_or_create_session"),
+            AgentType::ClaudeCodeAcp => {
+                let cc = self.cc.get_or_insert_with(|| ClaudeCode::new());
+                cc.ensure_started().await?;
+                if let Some(sid) = session_id {
+                    match cc.load_session(sid, pwd.clone()).await {
+                        Ok(result) => return Ok(result),
+                        Err(e) => tracing::warn!("Failed to load session, creating new: {e}"),
+                    }
+                }
+                cc.create_session(pwd).await
+            }
+            AgentType::OpenCode => {
+                let oc = self.opencode.get_or_insert_with(|| OpenCodeAgent::new());
+                oc.ensure_started().await?;
+                if let Some(sid) = session_id {
+                    match oc.load_session(sid, pwd.clone()).await {
+                        Ok(result) => return Ok(result),
+                        Err(e) => tracing::warn!("Failed to load session, creating new: {e}"),
+                    }
+                }
+                oc.create_session(pwd).await
+            }
+        }
     }
 
     pub async fn shutdown(&mut self) -> Result<(), AgentError> {
-        self.cc.shutdown().await
+        if let Some(cc) = &mut self.cc {
+            cc.shutdown().await?;
+        }
+        if let Some(oc) = &mut self.opencode {
+            oc.shutdown().await?;
+        }
+        Ok(())
     }
 }

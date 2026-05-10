@@ -108,6 +108,7 @@ dependencies = [
  "agent-client-protocol",
  "agent-client-protocol-tokio",
  "anyhow",
+ "async-trait",
  "clap",
  "dirs",
  "futures",
