@@ -151,7 +151,7 @@ impl MatrixBot {
             .await;
         tracing::info!("Encryption initialized");
 
-        // Check for duplicate gateway instances
+        // Check for another active instance on the same account
         let current_device_id = client.device_id().map(|d| d.to_string());
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -159,30 +159,31 @@ impl MatrixBot {
             .as_millis() as u64;
         let devices = client.devices().await?;
         for device in &devices.devices {
-            if device.display_name.as_deref() == Some("agent-gateway")
-                && Some(device.device_id.to_string()) != current_device_id
-            {
-                if let Some(ts) = device.last_seen_ts {
-                    let elapsed_ms = now_ms.saturating_sub(i64::from(ts.0) as u64);
-                    if elapsed_ms < 60_000 {
-                        anyhow::bail!(
-                            "Another gateway instance is already running (device {}). \
-                             Kill the other instance before starting a new one.",
-                            device.device_id,
-                        );
-                    }
-                    tracing::warn!(
-                        "Found stale gateway device {} (last seen {}s ago), continuing",
-                        device.device_id,
-                        elapsed_ms / 1000,
-                    );
-                } else {
+            if device.display_name.as_deref() != Some("agent-gateway") {
+                continue;
+            }
+            if Some(device.device_id.to_string()) == current_device_id {
+                continue;
+            }
+            if let Some(ts) = device.last_seen_ts {
+                let elapsed_ms = now_ms.saturating_sub(i64::from(ts.0) as u64);
+                if elapsed_ms < 60_000 {
                     anyhow::bail!(
-                        "Another gateway instance is running (device {}, no last_seen_ts). \
-                         Kill it before starting a new one.",
+                        "Another agent-gateway instance is already active (device {}). \
+                         Log out of the other instance first.",
                         device.device_id,
                     );
                 }
+                tracing::warn!(
+                    "Found stale gateway device {} (last seen {}s ago), continuing",
+                    device.device_id,
+                    elapsed_ms / 1000,
+                );
+            } else {
+                tracing::warn!(
+                    "Found gateway device {} with no last_seen, continuing",
+                    device.device_id,
+                );
             }
         }
 
@@ -272,21 +273,9 @@ impl MatrixBot {
                                                     if let MessageType::Text(text) =
                                                         &decrypted.content.msgtype
                                                     {
-                                                        let agent_session = match bot
-                                                            .get_or_create_session(&room)
-                                                            .await
-                                                        {
-                                                            Ok(a) => a,
-                                                            Err(e) => {
-                                                                let content = RoomMessageEventContent::text_plain(e.to_string());
-                                                                let _ = room.send(content).await;
-                                                                continue;
-                                                            }
-                                                        };
-                                                        bot.run_task(
+                                                        bot.run_user_prompt(
                                                             text.body.clone(),
                                                             room.clone(),
-                                                            agent_session,
                                                         )
                                                         .await;
                                                     }
@@ -551,11 +540,11 @@ impl MatrixBot {
                     }
                     None => {
                         let s = Session::new(room_id.to_owned());
-                        let pwd = s.pwd.clone().unwrap_or_else(make_temp_dir);
-                        let agent_type = AgentType::ClaudeCodeAcp;
                         save_session(&mut smap, &self.sessions_path, s);
-                        tracing::info!("New session for room {}: pwd={}", room_id, pwd.display());
-                        (pwd, agent_type, None)
+                        tracing::info!("New session for room {} (no agent)", room_id);
+                        return Err(AgentError::Acp(
+                            "No agent selected. Use /agent <type> to choose an agent.\nAvailable: none, claude-code-acp, opencode".into(),
+                        ));
                     }
                 };
                 drop(smap);
@@ -578,6 +567,18 @@ impl MatrixBot {
 }
 
 impl MatrixBot {
+    async fn run_user_prompt(&self, body: String, room: matrix_sdk::room::Room) {
+        let agent_session = match self.get_or_create_session(&room).await {
+            Ok(a) => a,
+            Err(e) => {
+                let content = RoomMessageEventContent::text_plain(e.to_string());
+                let _ = room.send(content).await;
+                return;
+            }
+        };
+        self.run_task(body, room, agent_session).await;
+    }
+
     async fn run_task(
         &self,
         body: String,
@@ -596,82 +597,82 @@ impl MatrixBot {
             return;
         }
 
-    const THINKING: &str = "*Thinking*";
-    let placeholder = RoomMessageEventContent::text_plain(THINKING);
-    let maybe_event_id = match room.send(placeholder).await {
-        Ok(r) => Some(r.event_id),
-        Err(e) => {
-            tracing::warn!("Failed to send placeholder, falling back to one-shot: {e}");
-            None
-        }
-    };
-
-    let mut full_output = String::new();
-    let mut last_edit = Instant::now();
-    loop {
-        if room.typing_notice(true).await.is_err() {
-            tracing::info!("Bot no longer in room {room_id}, stopping processing");
-            let _ = room.typing_notice(false).await;
-            break;
-        }
-
-        let mut done = false;
-        match agent_session.query_delta().await {
-            Ok(Some(AgentDelta::Text {
-                output,
-                done: is_done,
-            })) => {
-                if !output.is_empty() {
-                    full_output.push_str(&output);
-                }
-                done = is_done;
-            }
-            Ok(Some(AgentDelta::ToolCall { title })) => {
-                let content = RoomMessageEventContent::text_plain(&format!("> **{title}**"));
-                let _ = room.send(content).await;
-            }
-            Ok(None) => {}
+        const THINKING: &str = "*Thinking*";
+        let placeholder = RoomMessageEventContent::text_plain(THINKING);
+        let maybe_event_id = match room.send(placeholder).await {
+            Ok(r) => Some(r.event_id),
             Err(e) => {
-                tracing::error!("Error querying Claude Code: {e}");
+                tracing::warn!("Failed to send placeholder, falling back to one-shot: {e}");
+                None
+            }
+        };
+
+        let mut full_output = String::new();
+        let mut last_edit = Instant::now();
+        loop {
+            if room.typing_notice(true).await.is_err() {
+                tracing::info!("Bot no longer in room {room_id}, stopping processing");
+                let _ = room.typing_notice(false).await;
+                break;
+            }
+
+            let mut done = false;
+            match agent_session.query_delta().await {
+                Ok(Some(AgentDelta::Text {
+                    output,
+                    done: is_done,
+                })) => {
+                    if !output.is_empty() {
+                        full_output.push_str(&output);
+                    }
+                    done = is_done;
+                }
+                Ok(Some(AgentDelta::ToolCall { title })) => {
+                    let content = RoomMessageEventContent::text_plain(&format!("> **{title}**"));
+                    let _ = room.send(content).await;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!("Error querying Claude Code: {e}");
+                    break;
+                }
+            }
+
+            if let Some(ref event_id) = maybe_event_id {
+                let should_edit = done
+                    || (!full_output.is_empty() && last_edit.elapsed() >= Duration::from_secs(2));
+
+                if should_edit {
+                    let display = if done {
+                        full_output.clone()
+                    } else {
+                        format!("{}\n{THINKING}", full_output)
+                    };
+                    let edit = RoomMessageEventContent::text_plain(&display)
+                        .make_replacement(ReplacementMetadata::new(event_id.clone(), None), None);
+                    if let Err(e) = room.send(edit).await {
+                        tracing::warn!("Failed to edit message: {e}");
+                    }
+                    last_edit = Instant::now();
+                }
+            }
+
+            if done {
+                let _ = room.typing_notice(false).await;
+                if maybe_event_id.is_none() && !full_output.is_empty() {
+                    let content = RoomMessageEventContent::text_plain(&full_output);
+                    if let Err(e) = room.send(content).await {
+                        tracing::error!("Failed to send Claude response: {e}");
+                    }
+                }
                 break;
             }
         }
 
-        if let Some(ref event_id) = maybe_event_id {
-            let should_edit =
-                done || (!full_output.is_empty() && last_edit.elapsed() >= Duration::from_secs(2));
-
-            if should_edit {
-                let display = if done {
-                    full_output.clone()
-                } else {
-                    format!("{}\n{THINKING}", full_output)
-                };
-                let edit = RoomMessageEventContent::text_plain(&display)
-                    .make_replacement(ReplacementMetadata::new(event_id.clone(), None), None);
-                if let Err(e) = room.send(edit).await {
-                    tracing::warn!("Failed to edit message: {e}");
-                }
-                last_edit = Instant::now();
-            }
-        }
-
-        if done {
-            let _ = room.typing_notice(false).await;
-            if maybe_event_id.is_none() && !full_output.is_empty() {
-                let content = RoomMessageEventContent::text_plain(&full_output);
-                if let Err(e) = room.send(content).await {
-                    tracing::error!("Failed to send Claude response: {e}");
-                }
-            }
-            break;
+        if let Some(s) = self.sessions.lock().await.get_mut(&room_id) {
+            s.agent_session = Some(agent_session);
         }
     }
-
-    if let Some(s) = self.sessions.lock().await.get_mut(&room_id) {
-        s.agent_session = Some(agent_session);
-    }
-}
 }
 
 async fn on_room_message(
@@ -718,15 +719,7 @@ async fn on_room_message(
         }
     }
 
-    let agent_session = match bot.get_or_create_session(&room).await {
-        Ok(a) => a,
-        Err(e) => {
-            let content = RoomMessageEventContent::text_plain(e.to_string());
-            let _ = room.send(content).await;
-            return;
-        }
-    };
-    bot.run_task(text_content.body.clone(), room, agent_session).await;
+    bot.run_user_prompt(text_content.body.clone(), room).await;
 }
 
 async fn on_encrypted_message(
