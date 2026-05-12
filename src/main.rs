@@ -2,56 +2,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::Parser;
-use anyhow::Context;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use agent_gateway::agent::AgentRegistry;
 use agent_gateway::bot::matrix::{MatrixBot, Session};
 
-fn install_systemd_user() -> anyhow::Result<()> {
-    let home = dirs::home_dir().context("HOME not set")?;
-    let config_dir = home.join(".config/agent-gateway");
-    let unit_dir = home.join(".config/systemd/user");
-    std::fs::create_dir_all(&config_dir)?;
-    std::fs::create_dir_all(&unit_dir)?;
-
-    let service_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("service");
-
-    let config_dest = config_dir.join("config.toml");
-    if config_dest.exists() {
-        println!("Already exists, skipping: {}", config_dest.display());
-    } else {
-        std::fs::copy(service_dir.join("config.toml"), &config_dest)?;
-        println!("Created: {}", config_dest.display());
-    }
-
-    let service_dest = config_dir.join("agent-gateway.service");
-    if service_dest.exists() {
-        println!("Already exists, skipping: {}", service_dest.display());
-    } else {
-        std::fs::copy(service_dir.join("agent-gateway.service"), &service_dest)?;
-        println!("Created: {}", service_dest.display());
-    }
-
-    let exe = std::env::current_exe()?;
-    let exec_start = format!("{} --config {}", exe.display(), config_dest.display());
-    let unit_name = "agent-gateway.service";
-    let template = std::fs::read_to_string(service_dir.join("agent-gateway.service"))?;
-    let unit = template.replace("AGENT_GATEWAY_BIN", &exec_start);
-
-    let unit_dest = unit_dir.join(unit_name);
-    std::fs::write(&unit_dest, unit)?;
-    println!("Installed: {}", unit_dest.display());
-
-    let status = std::process::Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("systemctl --user daemon-reload failed");
-    }
-
-    println!("Done. Run 'systemctl --user start {unit_name}' to start.");
-    Ok(())
+fn default_config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".config/agent-gateway/config.toml")
 }
 
 fn resolve_dir(env_var: &str, xdg_var: &str, home_segment: &str) -> PathBuf {
@@ -68,42 +26,19 @@ fn resolve_dir(env_var: &str, xdg_var: &str, home_segment: &str) -> PathBuf {
 #[derive(Parser)]
 #[command(name = "agent-gateway", about = "Matrix gateway for Claude Code")]
 struct Cli {
-    /// Path to the gateway config file
+    /// Path to the gateway config file (default: ~/.config/agent-gateway/config.toml)
     #[arg(long)]
     config: Option<PathBuf>,
 
     /// Enable debug-level logging instead of info-level
     #[arg(long)]
     debug: bool,
-
-    /// Install systemd user unit and exit
-    #[arg(long)]
-    install_systemd_user: bool,
-
-    /// Start the systemd user service
-    #[arg(long)]
-    run_systemd: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-
-    if cli.install_systemd_user {
-        return install_systemd_user();
-    }
-
-    if cli.run_systemd {
-        let status = std::process::Command::new("systemctl")
-            .args(["--user", "start", "agent-gateway.service"])
-            .status()?;
-        if !status.success() {
-            anyhow::bail!("systemctl --user start agent-gateway.service failed");
-        }
-        return Ok(());
-    }
-
-    let config_path = cli.config.context("--config is required")?;
+    let config_path = cli.config.unwrap_or_else(default_config_path);
 
     let state_dir = resolve_dir("STATE_DIRECTORY", "XDG_STATE_HOME", ".local/state");
     let cache_dir = resolve_dir("CACHE_DIRECTORY", "XDG_CACHE_HOME", ".cache");

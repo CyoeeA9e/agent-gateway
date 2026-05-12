@@ -20,15 +20,7 @@ password = "your-matrix-password"
 allowed-user = ["@alice:example.com", "@bob:example.com"]
 ```
 
-### Install & Run
-
-```bash
-cargo install --path .
-agent-gateway --install-systemd-user   # install systemd unit
-agent-gateway --run-systemd            # start the service
-```
-
-Or run directly:
+### Run
 
 ```bash
 cargo run
@@ -40,8 +32,7 @@ cargo run
 |------|-------------|
 | `--config <path>` | Config file path (default: `gateway.toml`) |
 | `--print` | Print raw Claude stdout/stderr for debugging |
-| `--install-systemd-user` | Install user systemd unit and exit |
-| `--run-systemd` | Start via systemd |
+
 
 ## Commands
 

@@ -1,7 +1,0 @@
-[matrix]
-# Your bot's Matrix account ID
-id = "@user:server"
-# Matrix account password
-password = "your-matrix-password"
-# Users allowed to interact with the bot
-allowed-user = ["@alice:server"]

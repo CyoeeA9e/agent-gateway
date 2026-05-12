@@ -39,7 +39,6 @@ impl From<agent_client_protocol::Error> for AgentError {
 #[derive(Debug)]
 pub enum AgentDelta {
     Text { output: String, done: bool },
-    ToolCall { title: String },
 }
 
 #[async_trait]

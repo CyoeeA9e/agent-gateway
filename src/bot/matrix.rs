@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
 
 use anyhow::Context;
 use matrix_sdk::{
@@ -16,7 +17,7 @@ use matrix_sdk::{
                 encrypted::OriginalSyncRoomEncryptedEvent,
                 member::{MembershipState, OriginalSyncRoomMemberEvent, StrippedRoomMemberEvent},
                 message::{
-                    MessageType, OriginalSyncRoomMessageEvent, ReplacementMetadata,
+                    MessageType, OriginalSyncRoomMessageEvent,
                     RoomMessageEventContent,
                 },
             },
@@ -642,18 +643,7 @@ impl MatrixBot {
             return;
         }
 
-        const THINKING: &str = "*Thinking*";
-        let placeholder = RoomMessageEventContent::text_plain(THINKING);
-        let maybe_event_id = match room.send(placeholder).await {
-            Ok(r) => Some(r.event_id),
-            Err(e) => {
-                tracing::warn!("Failed to send placeholder, falling back to one-shot: {e}");
-                None
-            }
-        };
-
         let mut full_output = String::new();
-        let mut last_edit = Instant::now();
         loop {
             if room.typing_notice(true).await.is_err() {
                 tracing::info!("Bot no longer in room {room_id}, stopping processing");
@@ -672,10 +662,6 @@ impl MatrixBot {
                     }
                     done = is_done;
                 }
-                Ok(Some(AgentDelta::ToolCall { title })) => {
-                    let content = RoomMessageEventContent::text_plain(&format!("> **{title}**"));
-                    let _ = room.send(content).await;
-                }
                 Ok(None) => {}
                 Err(e) => {
                     tracing::error!("Error querying Claude Code: {e}");
@@ -683,28 +669,9 @@ impl MatrixBot {
                 }
             }
 
-            if let Some(ref event_id) = maybe_event_id {
-                let should_edit = done
-                    || (!full_output.is_empty() && last_edit.elapsed() >= Duration::from_secs(2));
-
-                if should_edit {
-                    let display = if done {
-                        full_output.clone()
-                    } else {
-                        format!("{}\n{THINKING}", full_output)
-                    };
-                    let edit = RoomMessageEventContent::text_plain(&display)
-                        .make_replacement(ReplacementMetadata::new(event_id.clone(), None), None);
-                    if let Err(e) = room.send(edit).await {
-                        tracing::warn!("Failed to edit message: {e}");
-                    }
-                    last_edit = Instant::now();
-                }
-            }
-
             if done {
                 let _ = room.typing_notice(false).await;
-                if maybe_event_id.is_none() && !full_output.is_empty() {
+                if !full_output.is_empty() {
                     let content = RoomMessageEventContent::text_plain(&full_output);
                     if let Err(e) = room.send(content).await {
                         tracing::error!("Failed to send Claude response: {e}");
