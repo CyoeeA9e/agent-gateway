@@ -31,6 +31,35 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{AgentDelta, AgentError, AgentRegistry, AgentSession, AgentType};
 use crate::config::GatewayConfig;
 
+#[derive(Debug)]
+pub enum MatrixError {
+    Agent(AgentError),
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for MatrixError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MatrixError::Agent(e) => write!(f, "{e}"),
+            MatrixError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for MatrixError {}
+
+impl From<AgentError> for MatrixError {
+    fn from(e: AgentError) -> Self {
+        MatrixError::Agent(e)
+    }
+}
+
+impl From<std::io::Error> for MatrixError {
+    fn from(e: std::io::Error) -> Self {
+        MatrixError::Io(e)
+    }
+}
+
 fn persist_sessions(sessions: &HashMap<String, Session>, path: &Path) {
     if let Ok(json) = serde_json::to_string_pretty(sessions) {
         let _ = std::fs::write(path, json);
@@ -254,14 +283,15 @@ impl MatrixBot {
                                     let mut p = bot.pending_encrypted.lock().await;
                                     p.remove(&room_id_str).unwrap_or_default()
                                 };
-                                if events.is_empty() {
-                                    continue;
+                                if !events.is_empty() {
+                                    tracing::info!("Processing {} pending events for {room_id_str}", events.len());
                                 }
-                                let Some(room) = key_client.get_room(room_id) else {
-                                    continue;
-                                };
-                                for event_id in &events {
-                                    match room.event(event_id, None).await {
+                                for event_id in events {
+                                    let room = match key_client.get_room(room_id) {
+                                        Some(room) => room,
+                                        None => continue,
+                                    };
+                                    match room.event(&event_id, None).await {
                                         Ok(timeline_event) => {
                                             let raw = timeline_event.raw();
                                             match raw.deserialize() {
@@ -415,107 +445,124 @@ impl Session {
     }
 }
 
-fn is_allowed(sender: &str, allowed: &HashSet<String>) -> bool {
-    allowed.contains(sender)
-}
-
-fn handle_command(
-    body: &str,
-    room_id: &str,
-    sessions: &mut HashMap<String, Session>,
-    sessions_path: &Path,
-) -> Option<String> {
-    if !body.starts_with('/') {
-        return None;
+impl MatrixBot {
+    fn is_allowed(&self, sender: &str) -> bool {
+        self.allowed.contains(sender)
     }
 
-    let cmd = body.trim();
-
-    if cmd == "/help" {
-        return Some(
-            "Available commands:\n/help — Show this help\n/setpwd <path> — Set working directory\n/reset — Reset the Claude Code session\n/agent <type> — Switch agent (none, claude-code-acp, opencode)"
-                .into(),
-        );
-    }
-
-    if cmd == "/reset" {
-        if let Some(session) = sessions.get_mut(room_id) {
-            session.agent_session = None;
-            session.clear_agent_session_id();
+    async fn handle_command(&self, body: &str, room_id: &str) -> Result<Option<String>, MatrixError> {
+        if !body.starts_with('/') {
+            return Ok(None);
         }
-        persist_sessions(sessions, sessions_path);
-        return Some("Session reset. A new session will be created on next message.".into());
-    }
 
-    if cmd == "/agent" {
-        let current = sessions
-            .get(room_id)
-            .map(|s| format!("{:?}", s.agent_type))
-            .unwrap_or_else(|| "none".into());
-        return Some(format!(
-            "Current agent: {current}\nAvailable: none, claude-code-acp, opencode"
-        ));
-    }
+        let cmd = body.trim();
 
-    if let Some(type_str) = cmd.strip_prefix("/agent ") {
-        let new_type = match type_str.trim() {
-            "opencode" => AgentType::OpenCode,
-            "claude-code-acp" => AgentType::ClaudeCodeAcp,
-            "none" => AgentType::None,
-            _ => {
-                return Some(
-                    "Unknown agent type. Available: none, claude-code-acp, opencode".into(),
-                );
+        if cmd == "/help" {
+            return Ok(Some(
+                "Available commands:\n/help — Show this help\n/setpwd <path> — Set working directory\n/reset — Reset the Claude Code session\n/agent <type> — Switch agent (none, claude-code-acp, opencode)"
+                    .into(),
+            ));
+        }
+
+        if cmd == "/reset" {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(room_id) {
+                session.agent_session = None;
+                session.clear_agent_session_id();
             }
-        };
-        if let Some(session) = sessions.get_mut(room_id) {
-            session.agent_session = None;
-            session.clear_agent_session_id();
-            session.agent_type = new_type;
+            persist_sessions(&sessions, &self.sessions_path);
+            return Ok(Some("Session reset. A new session will be created on next message.".into()));
         }
-        persist_sessions(sessions, sessions_path);
-        return Some(format!("Switched to {}.", type_str.trim()));
-    }
 
-    if cmd == "/setpwd" {
-        if let Some(session) = sessions.get(room_id) {
-            match session.pwd() {
-                Some(p) => return Some(format!("Working directory: {}", p.display())),
-                None => return Some("No working directory set. Usage: /setpwd <path>".into()),
+        if cmd == "/agent" {
+            let sessions = self.sessions.lock().await;
+            let current = sessions
+                .get(room_id)
+                .map(|s| format!("{:?}", s.agent_type))
+                .unwrap_or_else(|| "none".into());
+            return Ok(Some(format!(
+                "Current agent: {current}\nAvailable: none, claude-code-acp, opencode"
+            )));
+        }
+
+        if let Some(type_str) = cmd.strip_prefix("/agent ") {
+            let new_type = match type_str.trim() {
+                "opencode" => AgentType::OpenCode,
+                "claude-code-acp" => AgentType::ClaudeCodeAcp,
+                "none" => AgentType::None,
+                _ => {
+                    return Ok(Some(
+                        "Unknown agent type. Available: none, claude-code-acp, opencode".into(),
+                    ));
+                }
+            };
+            let mut sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(room_id) {
+                session.agent_session = None;
+                session.clear_agent_session_id();
+                session.agent_type = new_type;
             }
+            persist_sessions(&sessions, &self.sessions_path);
+            return Ok(Some(format!("Switched to {}.", type_str.trim())));
         }
-        return Some("No working directory set. Usage: /setpwd <path>".into());
-    }
 
-    if let Some(path_str) = cmd.strip_prefix("/setpwd ") {
-        let path_str = path_str.trim();
-        if path_str.is_empty() {
-            return Some("Usage: /setpwd <path>".into());
+        if cmd == "/setpwd" {
+            let sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get(room_id) {
+                match session.pwd() {
+                    Some(p) => return Ok(Some(format!("Working directory: {}", p.display()))),
+                    None => return Ok(Some("No working directory set. Usage: /setpwd <path>".into())),
+                }
+            }
+            return Ok(Some("No working directory set. Usage: /setpwd <path>".into()));
         }
-        match std::fs::canonicalize(path_str) {
-            Ok(p) if p.is_dir() => {
+
+        if let Some(path_str) = cmd.strip_prefix("/setpwd ") {
+            let path_str = path_str.trim();
+            if path_str.is_empty() {
+                return Ok(Some("Usage: /setpwd <path>".into()));
+            }
+
+            let p = match std::fs::canonicalize(path_str) {
+                Ok(p) if p.is_dir() => p,
+                Ok(_) => return Ok(Some(format!("Not a directory: {path_str}"))),
+                Err(e) => return Err(MatrixError::Io(e)),
+            };
+
+            let (agent_type, session_id) = {
+                let mut sessions = self.sessions.lock().await;
                 let session = sessions
                     .entry(room_id.to_owned())
                     .or_insert_with(|| Session::new(room_id.to_owned()));
                 session.set_pwd(Some(p.clone()));
-                persist_sessions(sessions, sessions_path);
-                return Some(format!("Working directory set to: {}", p.display()));
+                let agent_type = session.agent_type.clone();
+                let session_id = session.agent_session_id().map(|s| s.to_owned());
+                persist_sessions(&sessions, &self.sessions_path);
+                (agent_type, session_id)
+            };
+
+            if agent_type != AgentType::None {
+                if let Some(sid) = session_id {
+                    let mut cc = self.cc.lock().await;
+                    let (new_sid, new_session) = cc.create_session(p.clone(), &agent_type, Some(sid)).await?;
+
+                    let mut sessions = self.sessions.lock().await;
+                    if let Some(s) = sessions.get_mut(room_id) {
+                        s.set_agent_session_id(new_sid);
+                        s.agent_session = Some(new_session);
+                        persist_sessions(&sessions, &self.sessions_path);
+                    }
+                }
             }
-            Ok(_) => {
-                return Some(format!("Not a directory: {path_str}"));
-            }
-            Err(e) => {
-                return Some(format!("Invalid path: {path_str} ({e})"));
-            }
+
+            return Ok(Some(format!("Working directory set to: {}", p.display())));
         }
+
+        Ok(Some(format!(
+            "Unknown command: {cmd}\nType /help for available commands"
+        )))
     }
 
-    Some(format!(
-        "Unknown command: {cmd}\nType /help for available commands"
-    ))
-}
-
-impl MatrixBot {
     async fn get_or_create_session(
         &self,
         room: &matrix_sdk::room::Room,
@@ -564,9 +611,7 @@ impl MatrixBot {
             }
         }
     }
-}
 
-impl MatrixBot {
     async fn run_user_prompt(&self, body: String, room: matrix_sdk::room::Room) {
         let agent_session = match self.get_or_create_session(&room).await {
             Ok(a) => a,
@@ -684,7 +729,7 @@ async fn on_room_message(
         return;
     }
 
-    if !is_allowed(event.sender.as_str(), &bot.allowed) {
+    if !bot.is_allowed(event.sender.as_str()) {
         tracing::debug!("Ignoring message from non-allowed user {}", event.sender);
         return;
     }
@@ -701,21 +746,23 @@ async fn on_room_message(
     );
 
     if text_content.body.starts_with('/') {
-        let reply = {
-            let mut sessions_map = bot.sessions.lock().await;
-            handle_command(
-                &text_content.body,
-                room.room_id().as_str(),
-                &mut sessions_map,
-                &bot.sessions_path,
-            )
-        };
-        if let Some(reply) = reply {
-            let content = RoomMessageEventContent::text_plain(&reply);
-            if let Err(e) = room.send(content).await {
-                tracing::error!("Failed to send command reply: {e}");
+        match bot
+            .handle_command(&text_content.body, room.room_id().as_str())
+            .await
+        {
+            Ok(Some(reply)) => {
+                let content = RoomMessageEventContent::text_plain(&reply);
+                if let Err(e) = room.send(content).await {
+                    tracing::error!("Failed to send command reply: {e}");
+                }
+                return;
             }
-            return;
+            Ok(None) => {}
+            Err(e) => {
+                let content = RoomMessageEventContent::text_plain(format!("Error: {e}"));
+                let _ = room.send(content).await;
+                return;
+            }
         }
     }
 
@@ -731,7 +778,7 @@ async fn on_encrypted_message(
         return;
     }
 
-    if !is_allowed(event.sender.as_str(), &bot.allowed) {
+    if !bot.is_allowed(event.sender.as_str()) {
         tracing::debug!(
             "Ignoring encrypted message from non-allowed user {}",
             event.sender
@@ -765,7 +812,7 @@ async fn on_invite(
     let inviter = event.sender.to_string();
     tracing::info!("Invite from {inviter} to room {}", room.room_id());
 
-    if !is_allowed(&inviter, &bot.allowed) {
+    if !bot.is_allowed(&inviter) {
         tracing::info!("Rejecting invite from non-allowed user {inviter}");
         if let Err(e) = room.leave().await {
             tracing::warn!("Failed to reject invite for {}: {e}", room.room_id());

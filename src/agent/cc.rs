@@ -5,9 +5,9 @@ use std::time::Duration;
 use agent_client_protocol::{
     ActiveSession, ByteStreams, Client, ConnectionTo, SessionMessage,
     schema::{
-        ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionResponse, ProtocolVersion,
+        ContentBlock, InitializeRequest, NewSessionResponse, ProtocolVersion,
         RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-        SelectedPermissionOutcome, SessionNotification, SessionUpdate,
+        ResumeSessionRequest, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
     },
     util::MatchDispatch,
 };
@@ -116,10 +116,10 @@ impl ClaudeCode {
         Ok((sid, Box::new(session)))
     }
 
-    pub async fn load_session(&mut self, session_id: String, pwd: PathBuf) -> Result<(String, Box<dyn AgentSession>), AgentError> {
+    pub async fn resume_session(&mut self, session_id: String, pwd: PathBuf) -> Result<(String, Box<dyn AgentSession>), AgentError> {
         let conn = self.conn.as_ref().ok_or_else(|| AgentError::Acp("not connected".into()))?;
 
-        let request = LoadSessionRequest::new(session_id.clone(), pwd);
+        let request = ResumeSessionRequest::new(session_id.clone(), pwd);
         let loaded = conn
             .send_request(request)
             .block_task()
@@ -130,39 +130,9 @@ impl ClaudeCode {
         resp.modes = loaded.modes;
         resp.meta = loaded.meta;
 
-        let mut active_session = conn
+        let active_session = conn
             .attach_session(resp, vec![])
             .map_err(|e| AgentError::Acp(e.to_string()))?;
-
-        // Drain history replay (ends with AvailableCommandsUpdate or UsageUpdate)
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let drain_done = Arc::new(AtomicBool::new(false));
-        loop {
-            match active_session.read_update().await {
-                Ok(SessionMessage::SessionMessage(dispatch)) => {
-                    let flag = drain_done.clone();
-                    let _ = MatchDispatch::new(dispatch)
-                        .if_notification(async |notif: SessionNotification| {
-                            match &notif.update {
-                                SessionUpdate::AvailableCommandsUpdate(_) | SessionUpdate::UsageUpdate(_) => {
-                                    flag.store(true, Ordering::Relaxed);
-                                }
-                                _ => {}
-                            }
-                            Ok(())
-                        })
-                        .await
-                        .otherwise_ignore();
-                    if drain_done.load(Ordering::Relaxed) {
-                        break;
-                    }
-                }
-                Ok(SessionMessage::StopReason(_)) => break,
-                Ok(_) => continue,
-                Err(_) => break,
-            }
-        }
 
         let sid = active_session.session_id().clone().to_string();
         let session = ClaudeCodeSession::new(sid.clone(), active_session);

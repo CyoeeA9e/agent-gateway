@@ -83,9 +83,9 @@ impl AgentRegistry {
                 let cc = self.cc.get_or_insert_with(|| ClaudeCode::new());
                 cc.ensure_started().await?;
                 if let Some(sid) = session_id {
-                    match cc.load_session(sid, pwd.clone()).await {
+                    match cc.resume_session(sid, pwd.clone()).await {
                         Ok(result) => return Ok(result),
-                        Err(e) => tracing::warn!("Failed to load session, creating new: {e}"),
+                        Err(e) => tracing::warn!("Failed to resume session, creating new: {e}"),
                     }
                 }
                 cc.create_session(pwd).await
@@ -94,9 +94,9 @@ impl AgentRegistry {
                 let oc = self.opencode.get_or_insert_with(|| OpenCodeAgent::new());
                 oc.ensure_started().await?;
                 if let Some(sid) = session_id {
-                    match oc.load_session(sid, pwd.clone()).await {
+                    match oc.resume_session(sid, pwd.clone()).await {
                         Ok(result) => return Ok(result),
-                        Err(e) => tracing::warn!("Failed to load session, creating new: {e}"),
+                        Err(e) => tracing::warn!("Failed to resume session, creating new: {e}"),
                     }
                 }
                 oc.create_session(pwd).await

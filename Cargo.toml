@@ -16,7 +16,7 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-agent-client-protocol = { version = "0.11.1", features = ["unstable_session_usage"] }
+agent-client-protocol = { version = "0.11.1", features = ["unstable_session_usage", "unstable_session_resume"] }
 agent-client-protocol-tokio = "0.11.1"
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["compat"] }

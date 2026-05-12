@@ -14,9 +14,10 @@ cargo build             # compile
 cargo check             # type-check
 cargo clippy            # lint
 cargo fmt               # format
-cargo test              # all tests (sequential via RUST_TEST_THREADS=1)
 cargo run -- --config ~/.config/agent-gateway/config.toml    # --config is required
 ```
+
+No tests exist in the codebase.
 
 ## Restart
 
@@ -30,41 +31,45 @@ pkill -x agent-gateway 2>/dev/null; sleep 1; nohup cargo run -- --config ~/.conf
 
 ## Global duplicate instance protection
 
-Bot uses a shared account password. At startup it queries the device list and bails if another device named `agent-gateway` has `last_seen_ts < 60s`. This prevents two instances from running simultaneously with the same account. No mutual kick — the later instance simply exits with an error.
-
-No account_data lock, no heartbeat, no password auth needed at startup.
+At startup queries device list; bails if another device named `agent-gateway` has `last_seen_ts < 60s`. Prevents two instances running simultaneously with the same account.
 
 ## Architecture
 
-- **`src/agent.rs`** — `AgentSession` trait (`send_input`, `async fn query_delta` returning `Option<AgentDelta>`, `id`), `AgentType` enum (`None`, `ClaudeCodeAcp`, `OpenCode`), `AgentRegistry` (manages both backends lazily)
-- **`src/agent/cc.rs`** — `ClaudeCode`: spawns `claude-agent-acp`. `ClaudeCodeSession` holds `ActiveSession` directly, calls `send_prompt` / `read_update` on the ACP connection. `query_delta` has 1s timeout (no separate background task).
+- **`src/agent.rs`** — `AgentSession` trait, `AgentType` enum, `AgentRegistry` (manages both backends lazily)
+- **`src/agent/cc.rs`** — `ClaudeCode`: spawns `claude-agent-acp`. `query_delta` has 1s timeout.
 - **`src/agent/opencode.rs`** — `OpenCodeAgent`: same pattern but spawns `opencode acp`
-- **`src/bot/matrix.rs`** — `MatrixBot`: event handlers, session management, streaming response loop.
-- **`src/config.rs`** — TOML config parsing.
+- **`src/bot/matrix.rs`** — `MatrixBot`: all event handlers, session management, streaming response loop, commands.
+- **`src/config.rs`** — TOML config parsing (`GatewayConfig`).
 - **`src/main.rs`** — CLI args, dir resolution → `MatrixBot::new()` → `bot.run().await`
 
 ### Message flow
 
-1. `on_room_message` → command `/...` paths are handled by `handle_command()` directly.
-2. Plain text → `bot.run_user_prompt()` → `get_or_create_session()` → `run_task()`.
-3. `get_or_create_session()`: takes `agent_session` from `Session.agent_session.take()` (reuse), or creates via `AgentRegistry::create_session()`. Stored back after response.
-4. New room with no agent → returns error "No agent selected". User must `/agent claude-code-acp` or `/agent opencode` first. No auto-default.
+1. `on_room_message` → commands handled by `MatrixBot::handle_command()` (async method, locks sessions internally)
+2. Plain text → `bot.run_user_prompt()` → `get_or_create_session()` → `run_task()`
+3. `get_or_create_session()`: reuses `agent_session` from `Session.agent_session.take()` if available; otherwise `AgentRegistry::create_session()` which tries `session/resume` first (if `agent_session_id` exists), falls back to `session/new`
+4. New room with no agent → error "No agent selected". User must `/agent claude-code-acp` or `/agent opencode` first. No default.
+
+### Session lifecycle
+
+- **Session file**: `room_sessions.json` in state dir, persists `agent_session_id` for cross-restart resume.
+- **Cross-restart resume**: `session/resume` is attempted first; falls back to `session/new`.
+- **`/setpwd <path>`**: updates `Session.pwd` and, if an idle agent session exists, calls `AgentRegistry::create_session(pwd, type, Some(sid))` → triggers `session/resume` with new cwd → backend detects fingerprint change and recreates the process.
+- **Kick/leave**: session entry removed from map (drops `agent_session`, closing the ACP session).
+- **`/reset`**: drops current agent session, clears `agent_session_id`.
 
 ### ACP flow
 
 No background per-session actor:
-
 1. `send_input(text)` → `session.send_prompt(text)` (sync)
-2. `query_delta().await` → `session.read_update()` with 1s timeout, returns `Option<AgentDelta>`
-3. `run_task()` polls `query_delta()` in a loop (1s timeout doubles as pacing, no separate sleep)
-
-Permissions from the agent are auto-approved.
+2. `query_delta().await` → `session.read_update()` with 1s timeout
+3. `run_task()` polls `query_delta()` in a loop (1s timeout doubles as pacing)
+4. Permissions from the agent are auto-approved.
 
 ### Streaming responses
 
 Bot uses Matrix `m.replace` edits:
 1. Sends `*Thinking*` placeholder
-2. `run_task` polls `query_delta().await`, accumulates output
+2. `run_task` polls `query_delta()`, accumulates output
 3. Edits placeholder every 2s (or on completion)
 4. Final edit removes `*Thinking*`
 
@@ -73,14 +78,6 @@ Fallback: if placeholder send fails, sends one-shot message.
 ### Room leave safety
 
 `run_task` loop checks `room.typing_notice(true)` — 403 means no longer joined, triggers immediate break.
-
-### Session lifecycle
-
-- **Session file**: `room_sessions.json` in state dir, persists `agent_session_id` for cross-restart resume.
-- **Cross-restart resume**: on next message, `session/load` is attempted first; falls back to `session/new`.
-- **Kick/leave**: session entry removed from map (drops `agent_session`, closing the ACP session).
-- **`/reset`**: drops current agent session, clears `agent_session_id`.
-- **`/setpwd <path>`**: set working directory for the room's agent.
 
 ## Config
 
@@ -103,4 +100,5 @@ Data directories (XDG-style):
 
 - `README.md` is stale — it describes the old `claude -p` architecture, not the current ACP-based one. Do not rely on it.
 - `--debug` enables debug-level logging (default: info).
-- Tests run sequentially (`RUST_TEST_THREADS=1` in `.cargo/config.toml`).
+- `MatrixError` is a public enum in the `bot::matrix` module (`Agent` / `Io` variants), used as `handle_command` return error type.
+- `handle_command` returns `Result<Option<String>, MatrixError>`. `Ok(None)` = not a command; `Ok(Some(reply))` = handled; `Err(e)` = system error sent as `"Error: {e}"` to room.
