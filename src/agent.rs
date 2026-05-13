@@ -1,9 +1,10 @@
+pub mod acp;
 pub mod cc;
 pub mod opencode;
 
 use async_trait::async_trait;
 use cc::ClaudeCode;
-use opencode::OpenCodeAgent;
+use opencode::OpenCode;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -38,8 +39,14 @@ impl From<agent_client_protocol::Error> for AgentError {
 
 #[derive(Debug)]
 pub enum AgentDelta {
-    Text { output: String, done: bool },
-    ToolCall { title: String, input: Option<String> },
+    Text {
+        output: String,
+        done: bool,
+    },
+    ToolCall {
+        title: String,
+        input: Option<String>,
+    },
 }
 
 pub fn format_tool_input(raw: &Option<serde_json::Value>) -> Option<String> {
@@ -77,7 +84,7 @@ pub enum AgentType {
 
 pub struct AgentRegistry {
     cc: Option<ClaudeCode>,
-    opencode: Option<OpenCodeAgent>,
+    opencode: Option<OpenCode>,
 }
 
 impl AgentRegistry {
@@ -108,7 +115,7 @@ impl AgentRegistry {
                 cc.create_session(pwd).await
             }
             AgentType::OpenCode => {
-                let oc = self.opencode.get_or_insert_with(|| OpenCodeAgent::new());
+                let oc = self.opencode.get_or_insert_with(|| OpenCode::new());
                 oc.ensure_started().await?;
                 if let Some(sid) = session_id {
                     match oc.resume_session(sid, pwd.clone()).await {

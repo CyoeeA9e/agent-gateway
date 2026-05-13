@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-
 use anyhow::Context;
 use matrix_sdk::{
     Client, RoomMemberships,
