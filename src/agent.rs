@@ -39,6 +39,24 @@ impl From<agent_client_protocol::Error> for AgentError {
 #[derive(Debug)]
 pub enum AgentDelta {
     Text { output: String, done: bool },
+    ToolCall { title: String, input: Option<String> },
+}
+
+pub fn format_tool_input(raw: &Option<serde_json::Value>) -> Option<String> {
+    match raw {
+        Some(serde_json::Value::Object(map)) => {
+            let pairs: Vec<String> = map
+                .iter()
+                .map(|(k, v)| match v {
+                    serde_json::Value::String(s) => format!("{k}={s}"),
+                    _ => format!("{k}={v}"),
+                })
+                .collect();
+            Some(pairs.join(", "))
+        }
+        Some(val) => Some(val.to_string()),
+        None => None,
+    }
 }
 
 #[async_trait]

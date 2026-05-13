@@ -1,0 +1,12 @@
+# agent-gateway 配置文件示例
+# 复制到 ~/.config/agent-gateway/config.toml 并按需修改
+
+[matrix]
+# Matrix 机器人账号的完整 ID（包含 homeserver）
+id = "@bot:server"
+
+# Matrix 机器人密码
+password = "your_password"
+
+# 允许使用此机器人的用户列表（完整 Matrix ID）
+allowed-user = ["@admin:server"]

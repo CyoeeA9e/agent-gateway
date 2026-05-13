@@ -651,7 +651,6 @@ impl MatrixBot {
                 break;
             }
 
-            let mut done = false;
             match agent_session.query_delta().await {
                 Ok(Some(AgentDelta::Text {
                     output,
@@ -660,24 +659,41 @@ impl MatrixBot {
                     if !output.is_empty() {
                         full_output.push_str(&output);
                     }
-                    done = is_done;
+                    if is_done {
+                        let _ = room.typing_notice(false).await;
+                        if !full_output.is_empty() {
+                            let content = RoomMessageEventContent::text_plain(&full_output);
+                            if let Err(e) = room.send(content).await {
+                                tracing::error!("Failed to send Claude response: {e}");
+                            }
+                        }
+                        break;
+                    }
+                }
+                Ok(Some(AgentDelta::ToolCall { title, input })) => {
+                    // Flush accumulated thought text
+                    if !full_output.is_empty() {
+                        let content = RoomMessageEventContent::text_plain(&full_output);
+                        if let Err(e) = room.send(content).await {
+                            tracing::error!("Failed to send thought text: {e}");
+                        }
+                        full_output.clear();
+                    }
+                    // Send tool call notification
+                    let tool_msg = match input {
+                        Some(args) => format!("🔧 {}({})", title, args),
+                        None => format!("🔧 {}()", title),
+                    };
+                    let content = RoomMessageEventContent::text_plain(&tool_msg);
+                    if let Err(e) = room.send(content).await {
+                        tracing::error!("Failed to send tool call: {e}");
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => {
                     tracing::error!("Error querying Claude Code: {e}");
                     break;
                 }
-            }
-
-            if done {
-                let _ = room.typing_notice(false).await;
-                if !full_output.is_empty() {
-                    let content = RoomMessageEventContent::text_plain(&full_output);
-                    if let Err(e) = room.send(content).await {
-                        tracing::error!("Failed to send Claude response: {e}");
-                    }
-                }
-                break;
             }
         }
 

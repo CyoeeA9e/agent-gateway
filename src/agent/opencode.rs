@@ -8,13 +8,14 @@ use agent_client_protocol::{
         ContentBlock, InitializeRequest, NewSessionResponse, ProtocolVersion,
         RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
         ResumeSessionRequest, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
+        ToolCallStatus,
     },
     util::MatchDispatch,
 };
 use tokio::process::{Child, Command as TokioCommand};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use super::{AgentSession, AgentDelta, AgentError};
+use super::{format_tool_input, AgentSession, AgentDelta, AgentError};
 use async_trait::async_trait;
 
 pub struct OpenCodeSession {
@@ -49,13 +50,35 @@ impl AgentSession for OpenCodeSession {
                 let mut delta = None;
                 let _ = MatchDispatch::new(dispatch)
                     .if_notification(async |notif: SessionNotification| {
-                        if let SessionUpdate::AgentMessageChunk(chunk) = &notif.update {
-                            if let ContentBlock::Text(text) = &chunk.content {
-                                delta = Some(AgentDelta::Text {
-                                    output: text.text.clone(),
-                                    done: false,
-                                });
+                        match &notif.update {
+                            SessionUpdate::AgentMessageChunk(chunk) => {
+                                if let ContentBlock::Text(text) = &chunk.content {
+                                    delta = Some(AgentDelta::Text {
+                                        output: text.text.clone(),
+                                        done: false,
+                                    });
+                                }
                             }
+                            SessionUpdate::ToolCallUpdate(tcu) => {
+                                let is_in_progress = tcu
+                                    .fields
+                                    .status
+                                    .as_ref()
+                                    .is_some_and(|s| *s == ToolCallStatus::InProgress);
+                                if is_in_progress {
+                                    let title = tcu
+                                        .fields
+                                        .title
+                                        .as_deref()
+                                        .unwrap_or("tool")
+                                        .to_owned();
+                                    delta = Some(AgentDelta::ToolCall {
+                                        title,
+                                        input: format_tool_input(&tcu.fields.raw_input),
+                                    });
+                                }
+                            }
+                            _ => {}
                         }
                         Ok(())
                     })

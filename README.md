@@ -1,73 +1,77 @@
 # agent-gateway
 
-Matrix bot gateway for [Claude Code](https://claude.ai/code). Each Matrix room gets its own isolated Claude conversation with persistent context.
+Matrix ↔ Claude Code / OpenCode gateway via [ACP (Agent Client Protocol)](https://github.com/agentclientprotocol).
 
-## Setup
+Each Matrix room gets its own isolated agent session with persistent context. Sessions survive gateway restarts via ACP `session/resume`.
 
-### Prerequisites
+## Prerequisites
 
 - Rust toolchain (edition 2024)
-- [Claude Code](https://claude.ai/code) CLI (`claude`) in PATH and authenticated
+- `claude-agent-acp`: `npm install -g @agentclientprotocol/claude-agent-acp`
+- `opencode` (optional, for `/agent opencode`)
 
-### Configuration
+## Configuration
 
-Create `gateway.toml`:
+Create `~/.config/agent-gateway/config.toml`:
 
 ```toml
 [matrix]
-id = "@bot:example.com"
-password = "your-matrix-password"
-allowed-user = ["@alice:example.com", "@bob:example.com"]
+id = "@bot:server"
+password = "your_password"
+allowed-user = ["@admin:server"]
 ```
 
-### Run
+See `utils/config.toml` for a commented example.
+
+## Usage
 
 ```bash
 cargo run
 ```
 
-### CLI
-
 | Flag | Description |
 |------|-------------|
-| `--config <path>` | Config file path (default: `gateway.toml`) |
-| `--print` | Print raw Claude stdout/stderr for debugging |
+| `--config <path>` | Config file path (default: `~/.config/agent-gateway/config.toml`) |
+| `--debug` | Enable debug-level logging |
+| `--install-user-service` | Install systemd user service and exit |
 
-
-## Commands
-
-In a Matrix room, the bot responds to:
+### Room commands
 
 | Command | Description |
 |---------|-------------|
 | `/help` | Show available commands |
-| `/setpwd` | Show current working directory for the room |
-| `/setpwd <path>` | Set the working directory for Claude in this room |
+| `/agent <type>` | Switch agent (`none`, `claude-code-acp`, `opencode`) |
+| `/reset` | Reset the current agent session |
+| `/setpwd` | Show current working directory |
+| `/setpwd <path>` | Set the working directory for the agent |
 
-Each room defaults to an isolated temp directory.
+New rooms default to a temp directory and require `/agent` before any prompts.
+
+### systemd service
+
+```bash
+cargo run -- --install-user-service
+systemctl --user enable --now agent-gateway
+```
+
+The service unit is generated from `utils/agent-gateway.service` with the binary path and config path baked in.
 
 ## Architecture
 
-- `src/agent.rs` — `Agent` trait: `send_user_input` + `query_agent_delta`
-- `src/agent/cc.rs` — `ClaudeCode`: spawns `claude -p --output-format stream-json --verbose`, parses JSON stream events
-- `src/main.rs` — Matrix bot: invite handling, message routing, command dispatch, polling loop
-- `src/room_sessions.rs` — Persistent `room_id → Session` mapping via JSON
-- `src/session.rs` — `Session` per room: agent session ID, working directory
+- `src/bot/matrix.rs` — Matrix bot: invites, encrypted/plain messages, session management, commands
+- `src/agent.rs` — `AgentSession` trait, `AgentType` enum, `AgentRegistry` (shared backends)
+- `src/agent/cc.rs` — `ClaudeCode`: spawns `claude-agent-acp`, ACP tokio transport
+- `src/agent/opencode.rs` — `OpenCodeAgent`: spawns `opencode acp`, ACP tokio transport
 - `src/config.rs` — TOML config parsing
+- `src/main.rs` — CLI entrypoint, dir resolution, bot startup
 
-### Data directories
+Messages flow: `on_room_message` → `handle_command()` (if starts with `/`) or `run_user_prompt()` → `get_or_create_session()` → `run_task()` (poll ACP delta loop, send full output on completion).
 
-| Env var | Default | Purpose |
-|---------|---------|---------|
-| `STATE_DIRECTORY` / `XDG_STATE_HOME` | `~/.local/state/agent-gateway` | Matrix session, crypto store, room-sessions mapping |
-| `CACHE_DIRECTORY` / `XDG_CACHE_HOME` | `~/.cache/agent-gateway` | Claude session data |
+Permissions are auto-approved. Sessions persisted in `room_sessions.json` for cross-restart resume.
 
-## Testing
+## Data directories
 
-```bash
-cargo test                              # all tests (sequential)
-cargo test test_single_turn             # single test
-cargo test -- --nocapture               # show output
-```
-
-Integration tests cover single/multi-turn chat, tool use, session persistence, and encrypted Matrix round-trips.
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `STATE_DIRECTORY` | `~/.local/state/agent-gateway` | Matrix session, crypto store, room sessions |
+| `CACHE_DIRECTORY` | `~/.cache/agent-gateway` | Agent cache data |
