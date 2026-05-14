@@ -246,7 +246,7 @@ impl MatrixBot {
             client.add_event_handler(
                 move |event: OriginalSyncRoomMessageEvent, room: matrix_sdk::room::Room| {
                     let bot = bot.clone();
-                    async move { on_room_message(event, room, &bot).await }
+                    async move { on_room_message(event, room, bot).await }
                 },
             );
         }
@@ -705,7 +705,7 @@ impl MatrixBot {
 async fn on_room_message(
     event: OriginalSyncRoomMessageEvent,
     room: matrix_sdk::room::Room,
-    bot: &MatrixBot,
+    bot: Arc<MatrixBot>,
 ) {
     if *room.own_user_id() == event.sender {
         return;
@@ -727,28 +727,31 @@ async fn on_room_message(
         text_content.body,
     );
 
-    if text_content.body.starts_with('/') {
-        match bot
-            .handle_command(&text_content.body, room.room_id().as_str())
-            .await
-        {
-            Ok(Some(reply)) => {
-                let content = RoomMessageEventContent::text_plain(&reply);
-                if let Err(e) = room.send(content).await {
-                    tracing::error!("Failed to send command reply: {e}");
+    let body = text_content.body.clone();
+    tokio::spawn(async move {
+        if body.starts_with('/') {
+            match bot
+                .handle_command(&body, room.room_id().as_str())
+                .await
+            {
+                Ok(Some(reply)) => {
+                    let content = RoomMessageEventContent::text_plain(&reply);
+                    if let Err(e) = room.send(content).await {
+                        tracing::error!("Failed to send command reply: {e}");
+                    }
+                    return;
                 }
-                return;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                let content = RoomMessageEventContent::text_plain(format!("Error: {e}"));
-                let _ = room.send(content).await;
-                return;
+                Ok(None) => {}
+                Err(e) => {
+                    let content = RoomMessageEventContent::text_plain(format!("Error: {e}"));
+                    let _ = room.send(content).await;
+                    return;
+                }
             }
         }
-    }
 
-    bot.run_user_prompt(text_content.body.clone(), room).await;
+        bot.run_user_prompt(body, room).await;
+    });
 }
 
 async fn on_encrypted_message(
@@ -823,32 +826,9 @@ async fn on_invite(
     }
     drop(map);
 
-    let pwd = make_temp_dir();
-    let result = bot
-        .cc
-        .lock()
-        .await
-        .create_session(pwd.clone(), &AgentType::ClaudeCodeAcp, None)
-        .await;
-
     let room_id = joined.room_id().to_string();
     let mut map = bot.sessions.lock().await;
-    match result {
-        Ok((sid, agent)) => {
-            let s = Session {
-                room_id: room_id.clone(),
-                agent_session_id: Some(sid),
-                pwd: Some(pwd),
-                agent_type: AgentType::ClaudeCodeAcp,
-                agent_session: Some(agent),
-            };
-            tracing::info!("Created ACP session for room {room_id}");
-            save_session(&mut map, &bot.sessions_path, s);
-        }
-        Err(_) => {
-            save_session(&mut map, &bot.sessions_path, Session::new(room_id));
-        }
-    }
+    save_session(&mut map, &bot.sessions_path, Session::new(room_id));
 }
 
 async fn on_member_change(

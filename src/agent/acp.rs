@@ -8,7 +8,6 @@ use agent_client_protocol::{
         ContentBlock, InitializeRequest, NewSessionResponse, ProtocolVersion,
         RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
         ResumeSessionRequest, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
-        ToolCallStatus,
     },
     util::MatchDispatch,
 };
@@ -51,30 +50,17 @@ impl AgentSession for AcpSession {
                 let _ = MatchDispatch::new(dispatch)
                     .if_notification(async |notif: SessionNotification| {
                         match &notif.update {
+                            SessionUpdate::ToolCall(tc) => {
+                                delta = Some(AgentDelta::ToolCall {
+                                    title: tc.title.clone(),
+                                    input: format_tool_input(&tc.raw_input),
+                                });
+                            }
                             SessionUpdate::AgentMessageChunk(chunk) => {
                                 if let ContentBlock::Text(text) = &chunk.content {
                                     delta = Some(AgentDelta::Text {
                                         output: text.text.clone(),
                                         done: false,
-                                    });
-                                }
-                            }
-                            SessionUpdate::ToolCallUpdate(tcu) => {
-                                let is_in_progress = tcu
-                                    .fields
-                                    .status
-                                    .as_ref()
-                                    .is_some_and(|s| *s == ToolCallStatus::InProgress);
-                                if is_in_progress {
-                                    let title = tcu
-                                        .fields
-                                        .title
-                                        .as_deref()
-                                        .unwrap_or("tool")
-                                        .to_owned();
-                                    delta = Some(AgentDelta::ToolCall {
-                                        title,
-                                        input: format_tool_input(&tcu.fields.raw_input),
                                     });
                                 }
                             }
