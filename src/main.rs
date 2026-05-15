@@ -110,6 +110,12 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_default();
     tracing::info!("Loaded {} room sessions", sessions.len());
 
-    let bot = MatrixBot::new(AgentRegistry::new(), state_dir, config_path, sessions, sessions_path);
+    let bot = MatrixBot::new(
+        AgentRegistry::new(),
+        state_dir,
+        config_path,
+        sessions,
+        sessions_path,
+    );
     bot.run().await
 }

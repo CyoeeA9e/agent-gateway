@@ -104,7 +104,7 @@ impl AgentRegistry {
         match agent_type {
             AgentType::None => unreachable!("None is handled by get_or_create_session"),
             AgentType::ClaudeCodeAcp => {
-                let cc = self.cc.get_or_insert_with(|| ClaudeCode::new());
+                let cc = self.cc.get_or_insert_with(ClaudeCode::new);
                 cc.ensure_started().await?;
                 if let Some(sid) = session_id {
                     match cc.resume_session(sid, pwd.clone()).await {
@@ -115,7 +115,7 @@ impl AgentRegistry {
                 cc.create_session(pwd).await
             }
             AgentType::OpenCode => {
-                let oc = self.opencode.get_or_insert_with(|| OpenCode::new());
+                let oc = self.opencode.get_or_insert_with(OpenCode::new);
                 oc.ensure_started().await?;
                 if let Some(sid) = session_id {
                     match oc.resume_session(sid, pwd.clone()).await {

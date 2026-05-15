@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use tokio::process::{Child, Command as TokioCommand};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use super::{format_tool_input, AgentDelta, AgentError, AgentSession};
+use super::{AgentDelta, AgentError, AgentSession, format_tool_input};
 
 pub struct AcpSession {
     session_id: String,
@@ -27,7 +27,10 @@ impl AcpSession {
         session_id: String,
         session: ActiveSession<'static, agent_client_protocol::Agent>,
     ) -> Self {
-        AcpSession { session_id, session }
+        AcpSession {
+            session_id,
+            session,
+        }
     }
 }
 
@@ -72,12 +75,10 @@ impl AgentSession for AcpSession {
                     .otherwise_ignore();
                 Ok(delta)
             }
-            Ok(Ok(SessionMessage::StopReason(_))) => {
-                Ok(Some(AgentDelta::Text {
-                    output: String::new(),
-                    done: true,
-                }))
-            }
+            Ok(Ok(SessionMessage::StopReason(_))) => Ok(Some(AgentDelta::Text {
+                output: String::new(),
+                done: true,
+            })),
             Ok(Ok(_)) => Ok(None),
             Ok(Err(_)) | Err(_) => Ok(None),
         }
@@ -116,12 +117,14 @@ impl AcpBackend {
             .stderr(Stdio::inherit());
 
         let mut child = cmd.spawn()?;
-        let child_stdin = child.stdin.take().ok_or_else(|| {
-            AgentError::Acp(format!("Failed to open {agent_name} stdin"))
-        })?;
-        let child_stdout = child.stdout.take().ok_or_else(|| {
-            AgentError::Acp(format!("Failed to open {agent_name} stdout"))
-        })?;
+        let child_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AgentError::Acp(format!("Failed to open {agent_name} stdin")))?;
+        let child_stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AgentError::Acp(format!("Failed to open {agent_name} stdout")))?;
 
         let transport = ByteStreams::new(child_stdin.compat_write(), child_stdout.compat());
 
@@ -190,11 +193,7 @@ impl AcpBackend {
         self.shutdown_tx = Some(shutdown_tx);
 
         let err_msg = format!("{agent_name} ACP initialization failed");
-        self.conn = Some(
-            init_rx
-                .await
-                .map_err(|_| AgentError::Acp(err_msg))?,
-        );
+        self.conn = Some(init_rx.await.map_err(|_| AgentError::Acp(err_msg))?);
         Ok(())
     }
 
