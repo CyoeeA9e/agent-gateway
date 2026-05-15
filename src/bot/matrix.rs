@@ -186,7 +186,24 @@ impl MatrixBot {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let devices = client.devices().await?;
+        let devices = match tokio::time::timeout(
+            Duration::from_secs(15),
+            client.devices(),
+        )
+        .await
+        {
+            Ok(Ok(d)) => Some(d),
+            Ok(Err(e)) => {
+                tracing::warn!("Failed to fetch devices (continuing): {e}");
+                None
+            }
+            Err(_) => {
+                tracing::warn!("Timed out fetching devices (continuing)");
+                None
+            }
+        };
+
+        if let Some(devices) = devices {
         for device in &devices.devices {
             if device.display_name.as_deref() != Some("agent-gateway") {
                 continue;
@@ -214,6 +231,7 @@ impl MatrixBot {
                     device.device_id,
                 );
             }
+        }
         }
 
         // ---- invite handler ----
@@ -291,18 +309,37 @@ impl MatrixBot {
                                         Some(room) => room,
                                         None => continue,
                                     };
+
                                     match room.event(&event_id, None).await {
                                         Ok(timeline_event) => {
                                             let raw = timeline_event.raw();
                                             match raw.deserialize() {
                                                 Ok(AnySyncTimelineEvent::MessageLike(
+                                                    AnySyncMessageLikeEvent::RoomEncrypted(_),
+                                                )) => {
+                                                    tracing::warn!(
+                                                        "Event {event_id} still encrypted, re-queue"
+                                                    );
+                                                    bot.pending_encrypted
+                                                        .lock()
+                                                        .await
+                                                        .entry(room_id_str.clone())
+                                                        .or_default()
+                                                        .push(event_id.clone());
+                                                }
+                                                Ok(AnySyncTimelineEvent::MessageLike(
                                                     AnySyncMessageLikeEvent::RoomMessage(
-                                                        SyncMessageLikeEvent::Original(decrypted),
+                                                        SyncMessageLikeEvent::Original(d),
                                                     ),
                                                 )) => {
                                                     if let MessageType::Text(text) =
-                                                        &decrypted.content.msgtype
+                                                        &d.content.msgtype
                                                     {
+                                                        tracing::info!(
+                                                            "Processing decrypted msg from {} in {}",
+                                                            d.sender,
+                                                            room_id_str,
+                                                        );
                                                         bot.run_user_prompt(
                                                             text.body.clone(),
                                                             room.clone(),
@@ -311,13 +348,13 @@ impl MatrixBot {
                                                     }
                                                 }
                                                 _ => tracing::warn!(
-                                                    "Pending event {event_id} not a text message"
+                                                    "Pending event {event_id} unexpected type"
                                                 ),
                                             }
                                         }
                                         Err(e) => {
                                             tracing::warn!(
-                                                "Fetching pending event {event_id}: {e}"
+                                                "Fetching {event_id}: {e}, re-queuing"
                                             );
                                             bot.pending_encrypted
                                                 .lock()
@@ -617,7 +654,9 @@ impl MatrixBot {
             Ok(a) => a,
             Err(e) => {
                 let content = RoomMessageEventContent::text_plain(e.to_string());
-                let _ = room.send(content).await;
+                if let Err(e) = room.send(content).await {
+                    tracing::error!("Failed to send error reply: {e}");
+                }
                 return;
             }
         };
@@ -632,10 +671,14 @@ impl MatrixBot {
     ) {
         let room_id = room.room_id().to_string();
         if let Err(e) = agent_session.send_input(&body) {
-            tracing::error!("Failed to send input to Claude Code: {e}");
-            let _ = room.typing_notice(false).await;
+            tracing::error!("Failed to send input to agent: {e}");
+            if let Err(e2) = room.typing_notice(false).await {
+                tracing::warn!("Failed to stop typing notice: {e2}");
+            }
             let content = RoomMessageEventContent::text_plain(format!("Error: {e}"));
-            let _ = room.send(content).await;
+            if let Err(e2) = room.send(content).await {
+                tracing::error!("Failed to send error reply: {e2}");
+            }
             if let Some(s) = self.sessions.lock().await.get_mut(&room_id) {
                 s.agent_session = Some(agent_session);
             }
@@ -663,14 +706,13 @@ impl MatrixBot {
                         if !full_output.is_empty() {
                             let content = RoomMessageEventContent::text_plain(&full_output);
                             if let Err(e) = room.send(content).await {
-                                tracing::error!("Failed to send Claude response: {e}");
+                                tracing::error!("Failed to send agent response: {e}");
                             }
                         }
                         break;
                     }
                 }
                 Ok(Some(AgentDelta::ToolCall { title, input })) => {
-                    // Flush accumulated thought text
                     if !full_output.is_empty() {
                         let content = RoomMessageEventContent::text_plain(&full_output);
                         if let Err(e) = room.send(content).await {
@@ -678,7 +720,6 @@ impl MatrixBot {
                         }
                         full_output.clear();
                     }
-                    // Send tool call notification
                     let tool_msg = match input {
                         Some(args) => format!("🔧 {}({})", title, args),
                         None => format!("🔧 {}()", title),
@@ -690,7 +731,7 @@ impl MatrixBot {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::error!("Error querying Claude Code: {e}");
+                    tracing::error!("Error querying agent: {e}");
                     break;
                 }
             }
@@ -744,22 +785,25 @@ async fn on_room_message(
                 Ok(None) => {}
                 Err(e) => {
                     let content = RoomMessageEventContent::text_plain(format!("Error: {e}"));
-                    let _ = room.send(content).await;
+                    if let Err(e) = room.send(content).await {
+                        tracing::error!("Failed to send error reply: {e}");
+                    }
                     return;
                 }
             }
         }
 
+        tracing::info!("Running user prompt in {}", room.room_id());
         bot.run_user_prompt(body, room).await;
     });
 }
 
 async fn on_encrypted_message(
     event: OriginalSyncRoomEncryptedEvent,
-    _room: matrix_sdk::room::Room,
+    room: matrix_sdk::room::Room,
     bot: &MatrixBot,
 ) {
-    if *_room.own_user_id() == event.sender {
+    if *room.own_user_id() == event.sender {
         return;
     }
 
@@ -774,13 +818,13 @@ async fn on_encrypted_message(
     tracing::info!(
         "Encrypted message from {} in {}, queued for key stream",
         event.sender,
-        _room.room_id(),
+        room.room_id(),
     );
 
     bot.pending_encrypted
         .lock()
         .await
-        .entry(_room.room_id().to_string())
+        .entry(room.room_id().to_string())
         .or_default()
         .push(event.event_id);
 }
