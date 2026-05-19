@@ -19,3 +19,5 @@ agent-client-protocol = { version = "0.11.1", features = ["unstable_session_usag
 agent-client-protocol-tokio = "0.11.1"
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["compat"] }
+tokio-native-tls = "0.3"
+native-tls = "0.2"

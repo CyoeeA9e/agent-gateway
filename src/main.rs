@@ -6,7 +6,9 @@ use clap::Parser;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use agent_gateway::agent::AgentRegistry;
+use agent_gateway::bot::irc::IrcBot;
 use agent_gateway::bot::matrix::{MatrixBot, Session};
+use agent_gateway::config::GatewayConfig;
 
 fn default_config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -103,6 +105,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Cache directory: {}", cache_dir.display());
     tracing::info!("Config: {}", config_path.display());
 
+    let config = GatewayConfig::from_file(&config_path).ok();
+
     let sessions_path = state_dir.join("room_sessions.json");
     let sessions: HashMap<String, Session> = std::fs::read_to_string(&sessions_path)
         .ok()
@@ -110,12 +114,33 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_default();
     tracing::info!("Loaded {} room sessions", sessions.len());
 
-    let bot = MatrixBot::new(
+    let matrix_bot = MatrixBot::new(
         AgentRegistry::new(),
-        state_dir,
+        state_dir.clone(),
         config_path,
         sessions,
         sessions_path,
     );
-    bot.run().await
+
+    if let Some(ref cfg) = config
+        && let Some(irc_config) = cfg.irc.clone()
+    {
+        tracing::info!("Starting IRC bot for {}:{}", irc_config.server, irc_config.port);
+        let irc_bot = IrcBot::new(AgentRegistry::new(), irc_config, state_dir);
+        tokio::spawn(async move {
+            if let Err(e) = irc_bot.run().await {
+                tracing::error!("IRC bot exited with error: {e:?}");
+            }
+        });
+    }
+
+    match matrix_bot.run().await {
+        Ok(()) => {},
+        Err(e) => tracing::warn!("Matrix bot exited with error (this is OK for IRC-only testing): {e}"),
+    }
+
+    // Keep running if IRC bot is active
+    tokio::signal::ctrl_c().await.ok();
+    tracing::info!("Shutting down");
+    Ok(())
 }

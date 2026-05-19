@@ -274,44 +274,46 @@ impl MatrixBot {
     }
 
     fn spawn_key_stream_listener(self: &Arc<Self>, client: &Client) {
-        let key_client = client.clone();
-        let bot = self.clone();
-        tokio::spawn(async move {
-            let Some(mut stream) = key_client.encryption().room_keys_received_stream().await else {
-                tracing::warn!("No Olm machine for key stream");
-                return;
-            };
-            while let Some(data) = stream.next().await {
-                let Ok(keys) = data else {
-                    tracing::warn!("Key stream error");
-                    continue;
-                };
-                for key_info in keys {
-                    let room_id = key_info.room_id;
-                    let room_id_str = room_id.as_str().to_owned();
-                    let events = {
-                        let mut p = bot.pending_encrypted.lock().await;
-                        p.remove(&room_id_str).unwrap_or_default()
-                    };
-                    if events.is_empty() {
-                        continue;
-                    }
-                    tracing::info!(
-                        "Processing {} pending events for {room_id_str}",
-                        events.len()
-                    );
-                    let Some(room) = key_client.get_room(&room_id) else {
-                        continue;
-                    };
-                    for event_id in events {
-                        bot.process_pending_event(&room, &room_id_str, event_id)
-                            .await;
-                    }
-                }
-            }
-        });
+        tokio::spawn(key_stream_listener(self.clone(), client.clone()));
     }
+}
 
+async fn key_stream_listener(bot: Arc<MatrixBot>, key_client: Client) {
+    let Some(mut stream) = key_client.encryption().room_keys_received_stream().await else {
+        tracing::warn!("No Olm machine for key stream");
+        return;
+    };
+    while let Some(data) = stream.next().await {
+        let Ok(keys) = data else {
+            tracing::warn!("Key stream error");
+            continue;
+        };
+        for key_info in keys {
+            let room_id = key_info.room_id;
+            let room_id_str = room_id.as_str().to_owned();
+            let events = {
+                let mut p = bot.pending_encrypted.lock().await;
+                p.remove(&room_id_str).unwrap_or_default()
+            };
+            if events.is_empty() {
+                continue;
+            }
+            tracing::info!(
+                "Processing {} pending events for {room_id_str}",
+                events.len()
+            );
+            let Some(room) = key_client.get_room(&room_id) else {
+                continue;
+            };
+            for event_id in events {
+                bot.process_pending_event(&room, &room_id_str, event_id)
+                    .await;
+            }
+        }
+    }
+}
+
+impl MatrixBot {
     async fn process_pending_event(
         &self,
         room: &matrix_sdk::room::Room,
@@ -656,8 +658,12 @@ impl MatrixBot {
     }
 
     async fn run_user_prompt(&self, body: String, room: matrix_sdk::room::Room) {
-        let Ok(agent_session) = self.get_or_create_session(&room).await else {
-            return;
+        let agent_session = match self.get_or_create_session(&room).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.send_error(&room, &format!("Error: {e}")).await;
+                return;
+            }
         };
         self.run_task(body, room, agent_session).await;
     }

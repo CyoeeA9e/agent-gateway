@@ -47,7 +47,7 @@ impl AgentSession for AcpSession {
     }
 
     async fn query_delta(&mut self) -> Result<Option<AgentDelta>, AgentError> {
-        match tokio::time::timeout(Duration::from_secs(1), self.session.read_update()).await {
+        match tokio::time::timeout(Duration::from_millis(100), self.session.read_update()).await {
             Ok(Ok(SessionMessage::SessionMessage(dispatch))) => {
                 let mut delta = None;
                 let _ = MatchDispatch::new(dispatch)
@@ -58,6 +58,18 @@ impl AgentSession for AcpSession {
                                     title: tc.title.clone(),
                                     input: format_tool_input(&tc.raw_input),
                                 });
+                            }
+                            SessionUpdate::ToolCallUpdate(tc) => {
+                                let title = tc.fields.title.clone().unwrap_or_default();
+                                let has_input = tc.fields.raw_input.as_ref()
+                                    .and_then(|v| v.as_object())
+                                    .is_some_and(|o| !o.is_empty());
+                                if has_input {
+                                    delta = Some(AgentDelta::ToolCall {
+                                        title,
+                                        input: format_tool_input(&tc.fields.raw_input),
+                                    });
+                                }
                             }
                             SessionUpdate::AgentMessageChunk(chunk) => {
                                 if let ContentBlock::Text(text) = &chunk.content {
@@ -73,6 +85,7 @@ impl AgentSession for AcpSession {
                     })
                     .await
                     .otherwise_ignore();
+
                 Ok(delta)
             }
             Ok(Ok(SessionMessage::StopReason(_))) => Ok(Some(AgentDelta::Text {
@@ -80,7 +93,11 @@ impl AgentSession for AcpSession {
                 done: true,
             })),
             Ok(Ok(_)) => Ok(None),
-            Ok(Err(_)) | Err(_) => Ok(None),
+            Ok(Err(e)) => {
+                tracing::warn!("ACP read_update error: {e}");
+                Ok(None)
+            }
+            Err(_) => Ok(None),
         }
     }
 }
