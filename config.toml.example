@@ -1,0 +1,5 @@
+[xmpp]
+jid = "bot@example.com"
+password = "your_password"
+nick = "agentbot"
+rooms = ["room@conference.example.com"]

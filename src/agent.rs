@@ -1,12 +1,10 @@
 pub mod acp;
-pub mod cc;
-pub mod opencode;
+pub mod claude;
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use cc::ClaudeCode;
-use opencode::OpenCode;
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use serde_json;
 
 #[derive(Debug)]
 pub enum AgentError {
@@ -49,6 +47,28 @@ pub enum AgentDelta {
     },
 }
 
+#[async_trait]
+pub trait AgentSession: Send + Sync {
+    fn session_id(&self) -> &str;
+    async fn send_input(&self, text: &str) -> Result<(), AgentError>;
+    async fn query_delta(&self) -> Result<Option<AgentDelta>, AgentError>;
+}
+
+#[async_trait]
+impl AgentSession for Arc<dyn AgentSession + '_> {
+    fn session_id(&self) -> &str {
+        (**self).session_id()
+    }
+
+    async fn send_input(&self, text: &str) -> Result<(), AgentError> {
+        (**self).send_input(text).await
+    }
+
+    async fn query_delta(&self) -> Result<Option<AgentDelta>, AgentError> {
+        (**self).query_delta().await
+    }
+}
+
 pub fn format_tool_input(raw: &Option<serde_json::Value>) -> Option<String> {
     match raw {
         Some(serde_json::Value::Object(map)) => {
@@ -66,75 +86,21 @@ pub fn format_tool_input(raw: &Option<serde_json::Value>) -> Option<String> {
     }
 }
 
-#[async_trait]
-pub trait AgentSession: Send {
-    fn send_input(&mut self, text: &str) -> Result<(), AgentError>;
-    async fn query_delta(&mut self) -> Result<Option<AgentDelta>, AgentError>;
-    fn id(&self) -> String;
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum AgentType {
-    #[default]
-    None,
-    ClaudeCodeAcp,
-    OpenCode,
-}
-
-pub struct AgentRegistry {
-    cc: Option<ClaudeCode>,
-    opencode: Option<OpenCode>,
-}
-
-impl AgentRegistry {
-    pub fn new() -> Self {
-        AgentRegistry {
-            cc: None,
-            opencode: None,
-        }
-    }
-
-    pub async fn create_session(
-        &mut self,
-        pwd: PathBuf,
-        agent_type: &AgentType,
-        session_id: Option<String>,
-    ) -> Result<(String, Box<dyn AgentSession>), AgentError> {
-        match agent_type {
-            AgentType::None => unreachable!("None is handled by get_or_create_session"),
-            AgentType::ClaudeCodeAcp => {
-                let cc = self.cc.get_or_insert_with(ClaudeCode::new);
-                cc.ensure_started().await?;
-                if let Some(sid) = session_id {
-                    match cc.resume_session(sid, pwd.clone()).await {
-                        Ok(result) => return Ok(result),
-                        Err(e) => tracing::warn!("Failed to resume session, creating new: {e}"),
+pub fn format_tool_call_display(title: &str, input: &Option<String>) -> String {
+    match input {
+        Some(s) if !s.is_empty() => {
+            let pairs: Vec<String> = s
+                .split(", ")
+                .map(|pair| {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        format!("{k}=\"{v}\"")
+                    } else {
+                        pair.to_string()
                     }
-                }
-                cc.create_session(pwd).await
-            }
-            AgentType::OpenCode => {
-                let oc = self.opencode.get_or_insert_with(OpenCode::new);
-                oc.ensure_started().await?;
-                if let Some(sid) = session_id {
-                    match oc.resume_session(sid, pwd.clone()).await {
-                        Ok(result) => return Ok(result),
-                        Err(e) => tracing::warn!("Failed to resume session, creating new: {e}"),
-                    }
-                }
-                oc.create_session(pwd).await
-            }
+                })
+                .collect();
+            format!("{title}({})", pairs.join(", "))
         }
-    }
-
-    pub async fn shutdown(&mut self) -> Result<(), AgentError> {
-        if let Some(cc) = &mut self.cc {
-            cc.shutdown().await?;
-        }
-        if let Some(oc) = &mut self.opencode {
-            oc.shutdown().await?;
-        }
-        Ok(())
+        _ => title.to_string(),
     }
 }

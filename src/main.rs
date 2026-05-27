@@ -1,146 +1,63 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+mod agent;
+mod bot;
+mod command;
+mod config;
+mod request;
 
-use anyhow::Context;
 use clap::Parser;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tokio::signal::ctrl_c;
 
-use agent_gateway::agent::AgentRegistry;
-use agent_gateway::bot::irc::IrcBot;
-use agent_gateway::bot::matrix::{MatrixBot, Session};
-use agent_gateway::config::GatewayConfig;
+use bot::Bot;
+use bot::xmpp::XmppBot;
+use config::XmppConfig;
+use request::handle_request;
 
-fn default_config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config/agent-gateway/config.toml")
-}
-
-fn resolve_dir(env_var: &str, xdg_var: &str, home_segment: &str) -> PathBuf {
-    if let Ok(dir) = std::env::var(env_var) {
-        return PathBuf::from(dir);
-    }
-    if let Ok(xdg) = std::env::var(xdg_var) {
-        return PathBuf::from(xdg).join("agent-gateway");
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(home_segment).join("agent-gateway")
-}
-
-fn user_service_dir() -> PathBuf {
-    let base = if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg)
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".config")
-    };
-    base.join("systemd").join("user")
-}
-
-fn install_user_service(config_path: &Path) -> anyhow::Result<()> {
-    let binary = std::env::current_exe().context("failed to get current executable path")?;
-    let service_dir = user_service_dir();
-    std::fs::create_dir_all(&service_dir).context("failed to create systemd user service dir")?;
-
-    let unit_path = service_dir.join("agent-gateway.service");
-    let template = include_str!("../utils/agent-gateway.service");
-    let unit_content = template
-        .replace("{{binary}}", &binary.display().to_string())
-        .replace("{{config_path}}", &config_path.display().to_string());
-
-    std::fs::write(&unit_path, &unit_content).context("failed to write systemd unit file")?;
-
-    let status = std::process::Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status()
-        .context("failed to run systemctl --user daemon-reload")?;
-
-    if !status.success() {
-        anyhow::bail!("systemctl --user daemon-reload failed");
-    }
-
-    println!("Systemd user service installed: {}", unit_path.display());
-    println!("Start it with:  systemctl --user enable --now agent-gateway");
-    Ok(())
+#[derive(serde::Deserialize)]
+struct AppConfig {
+    xmpp: XmppConfig,
 }
 
 #[derive(Parser)]
-#[command(name = "agent-gateway", about = "Matrix gateway for Claude Code")]
+#[command(version, about = "XMPP bot that forwards messages to Claude Code via ACP")]
 struct Cli {
-    /// Path to the gateway config file (default: ~/.config/agent-gateway/config.toml)
-    #[arg(long)]
-    config: Option<PathBuf>,
-
-    /// Enable debug-level logging instead of info-level
-    #[arg(long)]
-    debug: bool,
-
-    /// Install systemd user service and exit
-    #[arg(long)]
-    install_user_service: bool,
+    /// Path to config file
+    #[arg(short = 'c', long = "config")]
+    config: Option<String>,
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    tracing_subscriber::fmt::init();
+
     let cli = Cli::parse();
-    let config_path = cli.config.unwrap_or_else(default_config_path);
+    let config_path = cli.config.unwrap_or_else(|| "config.toml".into());
 
-    if cli.install_user_service {
-        install_user_service(&config_path)?;
-        return Ok(());
-    }
-
-    let state_dir = resolve_dir("STATE_DIRECTORY", "XDG_STATE_HOME", ".local/state");
-    let cache_dir = resolve_dir("CACHE_DIRECTORY", "XDG_CACHE_HOME", ".cache");
-
-    std::fs::create_dir_all(&state_dir)?;
-    std::fs::create_dir_all(&cache_dir)?;
-
-    let log_level = if cli.debug { "debug" } else { "info" };
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| log_level.into()))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
-    tracing::info!("State directory: {}", state_dir.display());
-    tracing::info!("Cache directory: {}", cache_dir.display());
-    tracing::info!("Config: {}", config_path.display());
-
-    let config = GatewayConfig::from_file(&config_path).ok();
-
-    let sessions_path = state_dir.join("room_sessions.json");
-    let sessions: HashMap<String, Session> = std::fs::read_to_string(&sessions_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    tracing::info!("Loaded {} room sessions", sessions.len());
-
-    let matrix_bot = MatrixBot::new(
-        AgentRegistry::new(),
-        state_dir.clone(),
-        config_path,
-        sessions,
-        sessions_path,
-    );
-
-    if let Some(ref cfg) = config
-        && let Some(irc_config) = cfg.irc.clone()
-    {
-        tracing::info!("Starting IRC bot for {}:{}", irc_config.server, irc_config.port);
-        let irc_bot = IrcBot::new(AgentRegistry::new(), irc_config, state_dir);
-        tokio::spawn(async move {
-            if let Err(e) = irc_bot.run().await {
-                tracing::error!("IRC bot exited with error: {e:?}");
-            }
+    let config: AppConfig = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read {config_path}: {e}"))
+        .and_then(|s| toml::from_str(&s).map_err(|e| format!("Failed to parse {config_path}: {e}")))
+        .unwrap_or_else(|e| {
+            tracing::error!("{e}");
+            std::process::exit(1);
         });
-    }
 
-    match matrix_bot.run().await {
-        Ok(()) => {},
-        Err(e) => tracing::warn!("Matrix bot exited with error (this is OK for IRC-only testing): {e}"),
-    }
+    let mut bot = XmppBot::builder()
+        .jid(config.xmpp.jid)
+        .password(config.xmpp.password)
+        .nick(config.xmpp.nick)
+        .rooms(config.xmpp.rooms)
+        .build();
 
-    // Keep running if IRC bot is active
-    tokio::signal::ctrl_c().await.ok();
-    tracing::info!("Shutting down");
-    Ok(())
+    loop {
+        tokio::select! {
+            (req, maybe_session) = bot.listen_msg() => {
+                if !bot.handle_command(&req).await {
+                    tokio::spawn(handle_request(req, maybe_session));
+                }
+            }
+            _ = ctrl_c() => {
+                bot.shutdown().await;
+                break;
+            }
+        }
+    }
 }
