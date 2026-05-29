@@ -78,6 +78,15 @@ pub async fn try_handle<T: Request>(
         Command::New {
             agent: Some(agent_name),
         } => {
+            const SUPPORTED_AGENTS: &[&str] = &["claude", "opencode"];
+            if !SUPPORTED_AGENTS.contains(&agent_name.as_str()) {
+                req.resp(&format!(
+                    "Unknown agent: {agent_name}. Available agents: {}",
+                    SUPPORTED_AGENTS.join(", ")
+                ))
+                .await;
+                return true;
+            }
             if let Some(bot) = bot {
                 bot.set_agent(conversation, &agent_name).await;
             }
@@ -85,7 +94,12 @@ pub async fn try_handle<T: Request>(
             ).await;
         }
         Command::Pwd { path: None } => {
-            req.resp("Usage: /bot pwd <path>").await;
+            if let Some(bot) = bot {
+                let pwd = bot.get_pwd(conversation);
+                req.resp(&format!("Working directory: {}", pwd.display())).await;
+            } else {
+                req.resp("Usage: /bot pwd <path>").await;
+            }
         }
         Command::Pwd { path: Some(path) } => {
             let pwd = match std::fs::canonicalize(&path) {

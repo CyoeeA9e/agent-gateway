@@ -1,5 +1,6 @@
 pub mod acp;
 pub mod claude;
+pub mod opencode;
 
 use std::sync::Arc;
 

@@ -236,7 +236,15 @@ impl XmppBot {
             if agent.is_empty() {
                 None
             } else {
-                match crate::agent::claude::create_session(pwd.clone()).await {
+                let result = match agent.as_str() {
+                    "claude" => crate::agent::claude::create_session(pwd.clone()).await,
+                    "opencode" => crate::agent::opencode::create_session(pwd.clone()).await,
+                    other => {
+                        tracing::warn!("Unknown agent '{other}' for {conv_id}");
+                        return None;
+                    }
+                };
+                match result {
                     Ok(session) => {
                         let sid = session.session_id().to_owned();
                         let s: Arc<dyn AgentSession> = Arc::new(session);
@@ -260,7 +268,17 @@ impl XmppBot {
                 }
             }
         } else {
-            match crate::agent::claude::resume_session(session_id, pwd).await {
+            let result = match agent.as_str() {
+                "claude" => crate::agent::claude::resume_session(session_id, pwd).await,
+                "opencode" => crate::agent::opencode::resume_session(session_id, pwd).await,
+                other => {
+                    tracing::warn!("Unknown agent '{other}' for {conv_id}");
+                    stored.remove(conv_id);
+                    save_sessions(&self.sessions_path, &stored);
+                    return None;
+                }
+            };
+            match result {
                 Ok(session) => {
                     let s: Arc<dyn AgentSession> = Arc::new(session);
                     self.sessions.insert(conv_id.to_owned(), s.clone());
@@ -401,6 +419,12 @@ impl XmppBot {
 
 #[async_trait]
 impl Bot for XmppBot {
+    fn get_pwd(&self, conv_id: &str) -> std::path::PathBuf {
+        let stored = load_sessions(&self.sessions_path);
+        let pwd = stored.get(conv_id).map(|s| s.pwd.clone()).unwrap_or_else(default_pwd);
+        std::fs::canonicalize(&pwd).unwrap_or(pwd)
+    }
+
     async fn set_pwd(&mut self, conv_id: &str, pwd: std::path::PathBuf) {
         let mut stored = load_sessions(&self.sessions_path);
         stored.entry(conv_id.to_owned()).or_insert_with(|| StoredSession {

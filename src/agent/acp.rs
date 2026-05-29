@@ -22,7 +22,7 @@ use crate::agent::{AgentDelta, AgentError, AgentSession, format_tool_input};
 pub(crate) struct AcpSession {
     session_id: String,
     session: Mutex<ActiveSession<'static, agent_client_protocol::Agent>>,
-    pending_tool_title: StdMutex<Option<String>>,
+    pending_tool: StdMutex<Option<(String, Option<serde_json::Value>)>>,
 }
 
 impl AcpSession {
@@ -31,7 +31,7 @@ impl AcpSession {
         AcpSession {
             session_id: sid,
             session: Mutex::new(session),
-            pending_tool_title: StdMutex::new(None),
+            pending_tool: StdMutex::new(None),
         }
     }
 }
@@ -64,31 +64,44 @@ impl AgentSession for AcpSession {
                                     tc.title,
                                     format_tool_input(&tc.raw_input),
                                 );
-                                *self.pending_tool_title.lock().unwrap() = Some(tc.title.clone());
+                                *self.pending_tool.lock().unwrap() =
+                                    Some((tc.title.clone(), tc.raw_input.clone()));
                             }
                             SessionUpdate::ToolCallUpdate(tc) => {
-                                let title = tc.fields.title.clone().unwrap_or_default();
                                 let has_input = tc
                                     .fields
                                     .raw_input
                                     .as_ref()
                                     .and_then(|v| v.as_object())
                                     .is_some_and(|o| !o.is_empty());
-                                if has_input {
-                                    let input = format_tool_input(&tc.fields.raw_input);
-                                    let tool_name = self
-                                        .pending_tool_title
-                                        .lock()
-                                        .unwrap()
-                                        .take()
-                                        .unwrap_or(title);
+
+                                if let Some((pending_title, pending_input)) =
+                                    self.pending_tool.lock().unwrap().take()
+                                {
+                                    let tool_name = tc
+                                        .fields
+                                        .title
+                                        .clone()
+                                        .filter(|t| !t.is_empty())
+                                        .unwrap_or(pending_title);
+                                    let input = if has_input {
+                                        format_tool_input(&tc.fields.raw_input)
+                                    } else {
+                                        format_tool_input(&pending_input)
+                                    };
                                     tracing::info!("ToolCall: {tool_name} | input: {input:?}");
                                     delta = Some(AgentDelta::ToolCall {
                                         title: tool_name,
                                         input,
                                     });
-                                } else {
-                                    self.pending_tool_title.lock().unwrap().take();
+                                } else if let Some(title) =
+                                    tc.fields.title.clone().filter(|t| !t.is_empty())
+                                {
+                                    if has_input {
+                                        let input = format_tool_input(&tc.fields.raw_input);
+                                        tracing::info!("ToolCall: {title} | input: {input:?}");
+                                        delta = Some(AgentDelta::ToolCall { title, input });
+                                    }
                                 }
                             }
                             SessionUpdate::AgentMessageChunk(chunk) => {
@@ -139,6 +152,11 @@ impl AcpBackendBuilder {
 
     pub fn command(mut self, cmd: impl Into<String>) -> Self {
         self.command = Some(cmd.into());
+        self
+    }
+
+    pub fn args(mut self, args: Vec<String>) -> Self {
+        self.args = args;
         self
     }
 
